@@ -81,7 +81,7 @@ try:
     from dagma.linear import DagmaLinear
     from scipy.special import expit as sigmoid
 except ImportError:  # optional dependency, see causomic._optional
-    from causomic._optional import missing_dagma as DagmaLinear
+    from causomic._optional import MissingDagmaLinear as DagmaLinear
 
 
 class SparseHillClimb(HillClimbSearch):

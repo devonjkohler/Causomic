@@ -26,6 +26,15 @@ def missing_cogex(*_args, **_kwargs):
     raise ImportError(COGEX_INSTALL_HINT)
 
 
-def missing_dagma(*_args, **_kwargs):
-    """Placeholder for dagma symbols; raises a helpful error when used."""
-    raise ImportError(DAGMA_INSTALL_HINT)
+class MissingDagmaLinear:
+    """Placeholder for ``dagma.linear.DagmaLinear``.
+
+    This is a real class (rather than a function, like :func:`missing_cogex`)
+    so that modules which subclass ``DagmaLinear`` at import time (to layer
+    extra behavior on top of it) can still be defined when the optional
+    ``dagma`` dependency isn't installed. The helpful error is only raised if
+    the class is actually instantiated.
+    """
+
+    def __init__(self, *_args, **_kwargs):
+        raise ImportError(DAGMA_INSTALL_HINT)

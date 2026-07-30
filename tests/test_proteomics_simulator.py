@@ -108,6 +108,60 @@ def test_simulate_data_intervention_pins_node():
     assert np.allclose(out["Protein_data"]["X"], 7.0)
 
 
+def _chain_coefficients():
+    return {
+        "X": {"intercept": 20.0, "error": 1.0},
+        "Y": {"X": 1.5, "intercept": 10.0, "error": 1.0},
+        "Z": {"Y": 0.8, "intercept": 5.0, "error": 1.0},
+    }
+
+
+def test_simulate_data_intervention_propagates_to_direct_child():
+    """A clamped parent's shift must reach its child. Regression test: a child
+    used to center its clamped parent on that parent's OWN (post-clamp,
+    constant) batch mean, which trivially equals the clamp value and so
+    canceled the shift regardless of its magnitude - Z tracked its own
+    unshifted intercept no matter what Y was clamped to.
+    """
+    G = chain_graph()
+    out = ps.simulate_data(
+        G,
+        coefficients=_chain_coefficients(),
+        n=5000,
+        seed=1,
+        intervention={"Y": 40.0},
+        add_feature_var=False,
+        verbose=False,
+    )
+    expected_z = 5.0 + 0.8 * (40.0 - 10.0)  # Y's baseline intercept is 10.0
+    assert np.isclose(out["Protein_data"]["Y"].mean(), 40.0)
+    assert np.isclose(out["Protein_data"]["Z"].mean(), expected_z, atol=0.2)
+
+
+def test_simulate_data_intervention_propagates_through_grandchild():
+    """The shift must survive a second hop (X clamped; Z is X's grandchild,
+    not X's own child) - catches a narrower fix that only special-cased a
+    DIRECTLY clamped parent and still canceled the shift one hop further out,
+    since Y (not itself in `intervention`) was still centered on its own
+    (now-shifted) batch mean when generating Z.
+    """
+    G = chain_graph()
+    out = ps.simulate_data(
+        G,
+        coefficients=_chain_coefficients(),
+        n=5000,
+        seed=1,
+        intervention={"X": 30.0},
+        add_feature_var=False,
+        verbose=False,
+    )
+    expected_y = 10.0 + 1.5 * (30.0 - 20.0)  # X's baseline intercept is 20.0
+    expected_z = 5.0 + 0.8 * (expected_y - 10.0)
+    assert np.isclose(out["Protein_data"]["X"].mean(), 30.0)
+    assert np.isclose(out["Protein_data"]["Y"].mean(), expected_y, atol=0.2)
+    assert np.isclose(out["Protein_data"]["Z"].mean(), expected_z, atol=0.3)
+
+
 # --------------------------------------------------------------------------- #
 # Lower-level helpers
 # --------------------------------------------------------------------------- #

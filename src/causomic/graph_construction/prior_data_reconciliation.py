@@ -623,6 +623,18 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
 
     Choose BIC when interpretability and network sparsity are priorities.
     Choose AIC when predictive performance is the primary concern.
+
+    Interventional (GIES-style) scoring
+    ------------------------------------
+    Passing `interventional=True` together with `arm_labels` (and, usually,
+    `clamped_nodes`) switches `local_score` to a second code path that sums
+    log-likelihood contributions across experimental arms instead of fitting one
+    flat GLM over all of `data` - see `local_score` / `_local_score_interventional`.
+    This is strictly opt-in: with the default `interventional=False`, or with
+    `interventional=True` but no `arm_labels`, `local_score` runs the exact same
+    single-GLM-over-self.data code path as before this feature existed. Existing
+    callers (all of which construct this class without either argument) are
+    unaffected byte-for-byte.
     """
 
     def __init__(
@@ -631,12 +643,56 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
         edge_priors: Optional[dict] = None,
         prior_strength: float = 1.0,
         scale_with_n: bool = False,
+        interventional: bool = False,
+        arm_labels: Optional[pd.Series] = None,
+        clamped_nodes: Optional[dict] = None,
         **kwargs,
     ):
+        """
+        Parameters
+        ----------
+        data : pd.DataFrame
+            Observational (or, with `interventional=True`, pooled multi-arm)
+            dataset for scoring.
+        edge_priors : Optional[dict], default=None
+            Dictionary mapping (parent, child) tuples to prior probabilities [0,1].
+        prior_strength : float, default=1.0
+            Scaling factor for prior influence (λ parameter).
+        scale_with_n : bool, default=False
+            See `local_score`'s docstring for the (currently inert - the
+            multiplication is commented out) intended effect.
+        interventional : bool, default=False
+            If True *and* `arm_labels` is given, `local_score` sums per-arm
+            log-likelihoods (skipping arms where `variable` was clamped) instead
+            of fitting one GLM over all of `data`. Default False, and the
+            fallback when `arm_labels` is missing, reproduces prior behavior
+            exactly - see class docstring.
+        arm_labels : Optional[pd.Series], default=None
+            Per-sample experimental-arm label, one entry per row of `data`.
+            Must share `data`'s index. Required for the interventional branch to
+            activate at all; if None, `local_score` always uses the flat
+            observational path regardless of `interventional`.
+        clamped_nodes : Optional[dict], default=None
+            Maps an arm label (as found in `arm_labels`) to the list of node
+            names pharmacologically clamped in that arm. An arm absent from this
+            dict (or the dict being None/empty) is treated as having no clamped
+            nodes. A clamped node is only excluded from *its own* local-score
+            arm-contribution in the arm(s) where it's clamped; it remains a valid
+            regressor for every other variable's score in that same arm - that's
+            the whole point of interventional data (see
+            `_local_score_interventional`).
+        """
         super().__init__(data, **kwargs)
         self.edge_priors = edge_priors or {}
         self.prior_strength = prior_strength  # This is lambda
         self.scale_with_n = scale_with_n
+        self.interventional = interventional
+        if arm_labels is not None:
+            assert arm_labels.index.equals(
+                data.index
+            ), "arm_labels must share data's index (one label per row of data)."
+        self.arm_labels = arm_labels
+        self.clamped_nodes = clamped_nodes or {}
 
     def local_score(self, variable: str, parents: list) -> float:
         """
@@ -679,7 +735,15 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
 
         Error handling returns -inf for degenerate cases (singular covariance
         matrices, etc.) to exclude them from consideration.
+
+        If `self.interventional` and `self.arm_labels` are both set, this
+        delegates to `_local_score_interventional` instead - see that method.
+        Otherwise (the default), everything below is unchanged from before that
+        branch existed.
         """
+        if self.interventional and self.arm_labels is not None:
+            return self._local_score_interventional(variable, parents)
+
         try:
             ll, df_model = self._log_likelihood(variable=variable, parents=parents)
         except:
@@ -700,6 +764,106 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
         # prior_bonus *= self.prior_strength
         # if self.scale_with_n:
         #     prior_bonus *= np.log(self.data.shape[0])
+        return bic_score + prior_bonus
+
+    def _local_score_interventional(self, variable: str, parents: list) -> float:
+        """
+        GIES-style interventional local score: sum log-likelihood of
+        `variable | parents` across experimental arms, then apply the BIC
+        complexity penalty once over the pooled effective sample size.
+
+        For each arm in `self.arm_labels`, `variable`'s contribution is dropped
+        entirely if `variable` is listed in `self.clamped_nodes[arm]` - a clamped
+        node's value there is experimenter-set, not generated by its parents, so
+        that arm carries no information about *this* edge. Every other arm still
+        contributes, including arms where one of `parents` (not `variable`) is
+        clamped: clamping never removes a column from `self.data`, only changes
+        which arms' *rows* count toward `variable`'s own score, so a clamped
+        parent's (fixed) value remains a perfectly ordinary regressor for scoring
+        `variable` in that arm. This is asserted explicitly below rather than
+        left implicit.
+
+        `_log_likelihood` (inherited from pgmpy's LogLikelihoodGauss) always reads
+        `self.data`, with no data-argument override, so each arm's contribution is
+        computed by temporarily pointing `self.data` at that arm's row-subset,
+        calling `_log_likelihood`, and restoring `self.data` in a `finally` block -
+        reusing the exact same GLM-fitting code the observational branch uses,
+        rather than duplicating it.
+
+        Returns -inf if `variable` is clamped in every arm (nothing to score), if
+        any contributing arm's fit is singular (matches the observational
+        branch's all-or-nothing -inf handling), or if arms disagree on
+        `df_model` (a small, post-resampling arm can be rank-deficient for the
+        full parent set - treated as a degenerate fit, not raised on).
+        """
+        contributing_arms = [
+            arm
+            for arm in pd.unique(self.arm_labels)
+            if variable not in self.clamped_nodes.get(arm, [])
+        ]
+        if not contributing_arms:
+            return -np.inf
+
+        original_data = self.data
+        arm_lls = []
+        arm_df_models = []
+        arm_n_rows = []
+        try:
+            for arm in contributing_arms:
+                arm_data = original_data.loc[self.arm_labels == arm]
+
+                # Clamping a *parent* must never remove it as a regressor for
+                # `variable`'s score in an arm that still contributes - assert
+                # that explicitly rather than assuming the column survived.
+                missing_parent_cols = [p for p in parents if p not in arm_data.columns]
+                assert not missing_parent_cols, (
+                    f"Parent column(s) {missing_parent_cols} missing from arm "
+                    f"{arm!r}'s data - a clamped parent must remain usable as a "
+                    "regressor in every arm where it isn't the variable being scored."
+                )
+                if arm_data.empty:
+                    continue
+
+                self.data = arm_data
+                try:
+                    ll, df_model = self._log_likelihood(variable=variable, parents=parents)
+                except Exception:
+                    return -np.inf
+                finally:
+                    self.data = original_data
+
+                arm_lls.append(ll)
+                arm_df_models.append(df_model)
+                arm_n_rows.append(len(arm_data))
+        finally:
+            self.data = original_data
+
+        if len(set(arm_df_models)) != 1:
+            # A contributing arm can legitimately have too few (post-resampling)
+            # rows to estimate the full parameter set - e.g. a bootstrap
+            # resample of a 6-row arm can leave 1-2 rows, so statsmodels' GLM
+            # fit there is rank-deficient and reports a SMALLER df_model than an
+            # arm with enough rows for every parent. That's not a bug to raise
+            # on (unlike the missing-parent-column case above, which can never
+            # legitimately happen) - it's a degenerate fit, treated the same as
+            # any other singular fit: exclude this candidate.
+            return -np.inf
+        df_model = arm_df_models[0]
+        n_eff = sum(arm_n_rows)
+
+        # Complexity penalty applied ONCE over n_eff (pooled rows across
+        # contributing arms) - not per-arm, per the class's interventional-scoring
+        # contract.
+        bic_score = sum(arm_lls) - (((df_model + 2) / 2) * np.log(n_eff))
+
+        # Soft prior component - identical to the observational branch.
+        prior_bonus = 0
+        for parent in parents:
+            p = self.edge_priors[(parent, variable)]
+            p = np.clip(p, 1e-6, 1 - 1e-6)  # Avoid log(0)
+            log_odds = np.log(p / (1 - p))
+            prior_bonus += log_odds
+
         return bic_score + prior_bonus
 
 
@@ -766,6 +930,39 @@ def random_acyclic_subgraph(nodes, allowed_edges, inclusion_prob=0.15, rng=None,
     return dag
 
 
+def _resample_with_arm_floor(
+    combined: pd.DataFrame,
+    arm_col: str,
+    frac: float,
+    replace: bool,
+    floor: int,
+    rng: np.random.RandomState,
+) -> pd.DataFrame:
+    """Bootstrap-resample ``combined``, holding any arm smaller than ``floor`` rows fixed.
+
+    An arm with fewer rows than ``floor`` carries too little information to usefully
+    bootstrap: with-replacement resampling at a typical ``frac<1`` setting collapses it
+    to just 1-2 unique rows a meaningful fraction of the time, which isn't enough to
+    identify a multi-parent GLM fit and mostly produces candidates that get discarded as
+    singular (see the HPN-DREAM interventional consensus run that motivated this - a
+    6-row arm resampled at frac=0.65 from a 30-row pool got <=2 rows ~20% of the time).
+    Those arms are kept in full, unresampled, on every draw; only arms at or above
+    ``floor`` rows are bootstrap-resampled at (``frac``, ``replace``). ``floor=0``
+    (the default everywhere this is called) reproduces the original single pooled
+    ``.sample(...)`` call exactly, so this is opt-in only.
+    """
+    if not floor:
+        return combined.sample(frac=frac, replace=replace, random_state=rng)
+
+    parts = []
+    for _, arm_group in combined.groupby(arm_col, sort=False):
+        if len(arm_group) < floor:
+            parts.append(arm_group)
+        else:
+            parts.append(arm_group.sample(frac=frac, replace=replace, random_state=rng))
+    return pd.concat(parts)
+
+
 def process_bootstrap(
     data: pd.DataFrame,
     edge_priors: dict,
@@ -777,6 +974,10 @@ def process_bootstrap(
     random_init: bool = False,
     subsample_frac: float = 0.65,
     replace: bool = True,
+    interventional: bool = False,
+    arm_labels: Optional[pd.Series] = None,
+    clamped_nodes: Optional[dict] = None,
+    arm_resample_floor: int = 0,
 ) -> Optional[DAG]:
     """
     Process single bootstrap sample for causal discovery with uncertainty quantification.
@@ -810,6 +1011,22 @@ def process_bootstrap(
         If True, initialize the hill climb search from a random acyclic subgraph
         rather than an empty DAG. This can help escape local optima but increases
         run-to-run variability. Default is False.
+    interventional : bool, optional
+        Passed through to `score_fn` (only meaningful for a scoring class that
+        supports it, e.g. `BICGaussIndraPriors`). Default is False, which never
+        changes this function's resampling or scoring-construction code path -
+        see Notes.
+    arm_labels : Optional[pd.Series], optional
+        Per-sample experimental-arm label aligned to `data`'s index. Required
+        for `interventional` to take effect - default is None.
+    clamped_nodes : Optional[dict], optional
+        Passed through to `score_fn` unchanged when `interventional` is True.
+    arm_resample_floor : int, optional
+        Only meaningful when `arm_labels` is not None. Arms with fewer than this many
+        rows are kept in full (unresampled) on every bootstrap draw rather than being
+        bootstrap-resampled at (`subsample_frac`, `replace`) like the rest of the data
+        - see `_resample_with_arm_floor`. Default is 0, which disables this and
+        reproduces the original single pooled `.sample(...)` call exactly.
 
     Returns
     -------
@@ -836,6 +1053,11 @@ def process_bootstrap(
 
     The logging suppression prevents verbose output during parallel execution
     while maintaining error reporting for debugging.
+
+    With `arm_labels=None` (the default), `resampled_data`/`custom_score`
+    construction are exactly what they were before `interventional` existed -
+    the two branches below are never merged into one code path so that case
+    stays byte-for-byte unchanged.
     """
     import logging
 
@@ -846,10 +1068,38 @@ def process_bootstrap(
     rng = np.random.RandomState(seed)
     # subsample_frac<1 with replace=True -> a bootstrap resample (consensus mode);
     # subsample_frac=1 with replace=False -> the full data (best-of-restarts mode).
-    resampled_data = data.sample(frac=subsample_frac, replace=replace, random_state=rng)
+    if arm_labels is not None:
+        # Resample data and arm_labels TOGETHER, in one .sample() call on a
+        # combined frame, so a bootstrap resample can never desynchronize which
+        # arm label goes with which resampled row. Two separate .sample() calls
+        # sharing one RandomState would each advance its internal state and draw
+        # DIFFERENT rows on the second call - not the "same" resample.
+        combined = data.copy()
+        combined["__arm_label__"] = arm_labels
+        resampled_combined = _resample_with_arm_floor(
+            combined, "__arm_label__", subsample_frac, replace, arm_resample_floor, rng
+        )
+        resampled_arm_labels = resampled_combined.pop("__arm_label__")
+        resampled_data = resampled_combined
+    else:
+        resampled_data = data.sample(frac=subsample_frac, replace=replace, random_state=rng)
+        resampled_arm_labels = None
 
-    # Initialize the custom scoring function
-    custom_score = score_fn(resampled_data, edge_priors=edge_priors, prior_strength=prior_strength)
+    # Initialize the custom scoring function. interventional_kwargs stays empty
+    # unless interventional=True was explicitly requested, so score_fn classes
+    # that don't accept these kwargs at all (anything but BICGaussIndraPriors,
+    # today) are unaffected by this parameter existing.
+    interventional_kwargs = {}
+    if interventional:
+        interventional_kwargs = dict(
+            interventional=True, arm_labels=resampled_arm_labels, clamped_nodes=clamped_nodes
+        )
+    custom_score = score_fn(
+        resampled_data,
+        edge_priors=edge_priors,
+        prior_strength=prior_strength,
+        **interventional_kwargs,
+    )
 
     allowed = set(edge_priors.keys())
     est = estimator(data=resampled_data, allowed_additions=allowed)
@@ -1151,6 +1401,10 @@ def run_bootstrap(
     subsample_frac: float = 0.65,
     replace: bool = True,
     verbose: bool = True,
+    interventional: bool = False,
+    arm_labels: Optional[pd.Series] = None,
+    clamped_nodes: Optional[dict] = None,
+    arm_resample_floor: int = 0,
 ) -> list:
     """
     Run parallel bootstrap analysis for robust causal discovery with INDRA priors.
@@ -1253,6 +1507,12 @@ def run_bootstrap(
 
     The choice depends on computational resources and required precision
     for downstream biological interpretation and hypothesis generation.
+
+    interventional, arm_labels, clamped_nodes, arm_resample_floor are forwarded to
+    `process_bootstrap` (and from there to `score_fn`) unchanged - default is
+    `interventional=False`, `arm_labels=None`, `arm_resample_floor=0`, which never
+    alters this function's own behavior; only the values ultimately reaching
+    `process_bootstrap` change.
     """
     if verbose:
         print("INFO: Starting bootstrap causal discovery:")
@@ -1287,6 +1547,10 @@ def run_bootstrap(
             random_init=random_init,
             subsample_frac=subsample_frac,
             replace=replace,
+            interventional=interventional,
+            arm_labels=arm_labels,
+            clamped_nodes=clamped_nodes,
+            arm_resample_floor=arm_resample_floor,
         )
         for i in tqdm(range(n_bootstrap), desc="Hill Climb runs")
     )

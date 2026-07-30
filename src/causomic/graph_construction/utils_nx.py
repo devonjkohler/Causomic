@@ -537,6 +537,7 @@ def query_forward_paths(
     n_mediators: int = 1,
     med_ev_filter: Optional[List[int]] = None,
     med_src_filter: Optional[List[int]] = None,
+    exclude_other_starts: bool = True,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Search for simple forward paths from any start node to any end node.
@@ -552,10 +553,19 @@ def query_forward_paths(
     end nodes. This corresponds to path lengths of ``mediator_count + 1``
     edges, subject to the corresponding evidence and source count thresholds.
 
-    Paths are not allowed to pass through any other start node: when
-    searching from a given ``start`` to a given ``end``, any node in
-    ``start_nodes`` other than ``start`` (and ``end`` itself, if it happens
-    to be in ``start_nodes``) is excluded from intermediate traversal.
+    When ``exclude_other_starts`` is True (the default), paths are not
+    allowed to pass through any other start node: when searching from a
+    given ``start`` to a given ``end``, any node in ``start_nodes`` other
+    than ``start`` (and ``end`` itself, if it happens to be in
+    ``start_nodes``) is excluded from intermediate traversal. This is the
+    right behavior when ``start_nodes`` and ``end_nodes`` are genuinely
+    distinct groups (e.g. drug targets vs. disease targets) and a path
+    shouldn't be credited to routing through another root cause.
+
+    Set ``exclude_other_starts=False`` for the closed-neighborhood case
+    where ``start_nodes`` and ``end_nodes`` are the same list of nodes and
+    you want all pairwise relations among them, including ones mediated by
+    other members of that same list (see :func:`query_neighborhood_paths`).
 
     Args:
         graph: DiGraph annotated with evidence counts on edges.
@@ -569,6 +579,10 @@ def query_forward_paths(
         med_src_filter: Per-depth source-count thresholds: a list of length
             ``n_mediators + 1`` where index ``i`` applies to paths with
             ``i`` mediators. If None, defaults to all ones.
+        exclude_other_starts: If True (default), other nodes in
+            ``start_nodes`` are excluded from intermediate traversal for any
+            given (start, end) pair. Set to False to allow other start nodes
+            to serve as mediators.
 
     Returns:
         A pandas.DataFrame with rows for each edge that appears on any
@@ -604,7 +618,7 @@ def query_forward_paths(
             continue
 
         for end in end_nodes_list:
-            excluded = start_nodes_set - {start, end}
+            excluded = (start_nodes_set - {start, end}) if exclude_other_starts else set()
 
             for med in range(0, n_mediators + 1):
                 cutoff = med + 1
@@ -636,3 +650,56 @@ def query_forward_paths(
     )
 
     return forward_df
+
+
+def query_neighborhood_paths(
+    graph: nx.DiGraph,
+    nodes: Iterable[str],
+    n_mediators: int = 1,
+    med_ev_filter: Optional[List[int]] = None,
+    med_src_filter: Optional[List[int]] = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Find all pairwise INDRA relations among a single list of nodes.
+
+    Thin wrapper around :func:`query_forward_paths` for the closed-set case:
+    every node in ``nodes`` is used as both a start and an end node, and
+    ``exclude_other_starts`` is forced to False so that other members of
+    ``nodes`` are allowed to serve as mediators between any given pair
+    instead of being excluded as "other start nodes" (see
+    :func:`query_forward_paths` for why that exclusion exists and why it
+    would otherwise block legitimate internal mediators here).
+
+    Mediator eligibility beyond this is governed entirely by ``graph``, not
+    by this function: if mediators should be limited to a known set of
+    measured proteins, build ``graph`` via
+    ``prepare_graph(raw_graph, measured_nodes=nodes)`` (or another
+    appropriate node set) before calling this function.
+
+    Args:
+        graph: DiGraph annotated with evidence counts on edges.
+        nodes: Iterable of node ids defining the closed neighborhood.
+        n_mediators: Maximum number of intermediate nodes allowed on a
+            path between any two nodes (path length = n_mediators + 1 edges).
+        med_ev_filter: Per-depth evidence-count thresholds, forwarded to
+            :func:`query_forward_paths`.
+        med_src_filter: Per-depth source-count thresholds, forwarded to
+            :func:`query_forward_paths`.
+        verbose: Forwarded to :func:`query_forward_paths`.
+
+    Returns:
+        A pandas.DataFrame with rows for each edge that appears on any
+        discovered path. Columns: ["source", "target", "evidence_count",
+        "source_count"].
+    """
+    nodes_list = list(nodes)
+    return query_forward_paths(
+        graph,
+        start_nodes=nodes_list,
+        end_nodes=nodes_list,
+        n_mediators=n_mediators,
+        med_ev_filter=med_ev_filter,
+        med_src_filter=med_src_filter,
+        exclude_other_starts=False,
+        verbose=verbose,
+    )

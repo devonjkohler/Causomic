@@ -293,7 +293,16 @@ def consensus_dag(bootstrap_dags, indra_priors, lam=0.25, min_freq=0.5):
     return G
 
 
-def best_scoring_dag(dags, data, edge_priors, scoring_function, prior_strength):
+def best_scoring_dag(
+    dags,
+    data,
+    edge_priors,
+    scoring_function,
+    prior_strength,
+    interventional: bool = False,
+    arm_labels=None,
+    clamped_nodes=None,
+):
     """Select the single highest-scoring acyclic DAG from candidate runs.
 
     Each candidate is scored by its total local score
@@ -315,6 +324,16 @@ def best_scoring_dag(dags, data, edge_priors, scoring_function, prior_strength):
         more heavily than AIC and is the recommended choice here.
     prior_strength : float
         Passed through to the scoring function.
+    interventional : bool, optional
+        Forwarded to ``scoring_function`` only when True (default False never
+        adds these kwargs to the ``scoring_function(...)`` call at all, so
+        scoring classes without this parameter are unaffected).
+    arm_labels : Optional[pd.Series], optional
+        Per-sample experimental-arm label aligned to ``data``'s index. Unlike
+        ``run_bootstrap``'s bootstrap resamples, ``data`` here is used as-is
+        (never resampled), so ``arm_labels`` is passed through unmodified.
+    clamped_nodes : Optional[dict], optional
+        Forwarded to ``scoring_function`` unchanged when ``interventional`` is True.
 
     Returns
     -------
@@ -323,7 +342,14 @@ def best_scoring_dag(dags, data, edge_priors, scoring_function, prior_strength):
         columns if none are valid); ``scores`` is the per-candidate total score
         (``None`` for missing or cyclic runs), aligned with ``dags``.
     """
-    scorer = scoring_function(data, edge_priors=edge_priors, prior_strength=prior_strength)
+    interventional_kwargs = {}
+    if interventional:
+        interventional_kwargs = dict(
+            interventional=True, arm_labels=arm_labels, clamped_nodes=clamped_nodes
+        )
+    scorer = scoring_function(
+        data, edge_priors=edge_priors, prior_strength=prior_strength, **interventional_kwargs
+    )
     best, best_score, scores = None, -np.inf, []
     for dag in dags:
         if dag is None:
@@ -368,6 +394,11 @@ def estimate_posterior_dag(
     dagma_fit_kwargs: Optional[dict] = None,
     return_runs: bool = False,
     verbose: bool = True,
+    interventional: bool = False,
+    arm_labels: Optional[pd.Series] = None,
+    clamped_nodes: Optional[dict] = None,
+    arm_resample_floor: int = 0,
+    consensus_subsample_frac: Optional[float] = None,
 ) -> NxMixedGraph:
     """
     Estimate a posterior directed acyclic graph (DAG) using bootstrap sampling.
@@ -487,6 +518,48 @@ def estimate_posterior_dag(
         often necessary. Only used when selection is "dagma" or
         "dagma_weighted". Default is None (DagmaLinear.fit's own defaults).
 
+    interventional : bool, optional
+        If True (and `arm_labels` is given), every scorer constructed inside this
+        call - both the per-restart/per-resample scorers in `run_bootstrap` and,
+        for `selection="best_of"`, the final re-scoring in `best_scoring_dag` -
+        uses `scoring_function`'s GIES-style interventional local score instead
+        of a single flat GLM fit over all of `data`. Default False, and the
+        fallback whenever `arm_labels` is None, reproduces this function's prior
+        behavior exactly - `scoring_function` is never even passed these kwargs
+        in that case. Only meaningful with a `scoring_function` that supports
+        `interventional`/`arm_labels`/`clamped_nodes` (currently
+        `BICGaussIndraPriors`).
+
+    arm_labels : Optional[pd.Series], optional
+        Per-sample experimental-arm label, one entry per row of `data`, sharing
+        `data`'s index. Required for `interventional` to take effect.
+
+    clamped_nodes : Optional[dict], optional
+        Maps an arm label (as found in `arm_labels`) to the list of node names
+        pharmacologically clamped in that arm. Forwarded unchanged wherever
+        `interventional` is active - see `BICGaussIndraPriors`.
+
+    arm_resample_floor : int, optional
+        Only meaningful when `arm_labels` is not None and `selection="consensus"`
+        (i.e. `subsample_frac<1`) - `selection="best_of"` never resamples at all, so
+        this has no effect there. Arms with fewer than this many rows are kept in full
+        on every bootstrap draw rather than being bootstrap-resampled like the rest of
+        the data, since a small arm resampled at a typical frac<1 collapses to too few
+        unique rows to reliably fit a multi-parent model - see
+        `prior_data_reconciliation._resample_with_arm_floor`. Default is 0, which
+        disables this and reproduces the original pooled-resample behavior exactly.
+
+    consensus_subsample_frac : Optional[float], optional
+        Only meaningful for `selection="consensus"` - overrides its hardcoded
+        `subsample_frac=0.65`. Added for contexts where the full dataset is already so
+        small (e.g. n=5-6) that a further 65% subsample collapses to too few rows to
+        fit almost any candidate parent set (near-universal degenerate/-inf scores,
+        see BT20's HPN-DREAM contexts). `consensus_subsample_frac=1.0` recovers the
+        standard bootstrap (resample with replacement at the original size, not a
+        smaller subsample) while still producing genuine resampling variability for the
+        edge vote. Default `None` leaves the original 0.65 behavior exactly unchanged -
+        this parameter has zero effect unless explicitly set.
+
     Returns
     -------
     NxMixedGraph or tuple[NxMixedGraph, list]
@@ -600,6 +673,8 @@ def estimate_posterior_dag(
             run_frac, run_replace, run_random_init = 1.0, False, True
         elif selection == "consensus":
             run_frac, run_replace, run_random_init = 0.65, True, random_init
+            if consensus_subsample_frac is not None:
+                run_frac = consensus_subsample_frac
         else:
             raise ValueError(
                 f"Unknown selection={selection!r}; use 'best_of', 'consensus', 'dagma', "
@@ -623,6 +698,10 @@ def estimate_posterior_dag(
             subsample_frac=run_frac,
             replace=run_replace,
             verbose=verbose,
+            interventional=interventional,
+            arm_labels=arm_labels,
+            clamped_nodes=clamped_nodes,
+            arm_resample_floor=arm_resample_floor,
         )
 
         # Reduce the runs to one posterior DAG
@@ -631,7 +710,14 @@ def estimate_posterior_dag(
                 indra_priors, convert_to_probability, use_source_counts
             )
             best_dag, run_scores = best_scoring_dag(
-                bootstrap_dags, data, edge_priors, scoring_function, prior_strength
+                bootstrap_dags,
+                data,
+                edge_priors,
+                scoring_function,
+                prior_strength,
+                interventional=interventional,
+                arm_labels=arm_labels,
+                clamped_nodes=clamped_nodes,
             )
             posterior_dag = pd.DataFrame(list(best_dag.edges()), columns=["source", "target"])
         else:

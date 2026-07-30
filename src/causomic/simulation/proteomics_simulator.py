@@ -204,6 +204,25 @@ def simulate_data(
 
     sorted_nodes = [i for i in nx.topological_sort(graph) if i != "cell_type"]
 
+    # Every node's expected value under pure observation equals its intercept
+    # (mean-centering makes each parent's contribution vanish in expectation,
+    # recursively) - same invariant random_network.ground_truth_interventional_effect
+    # relies on. Needed below so a child of a SHIFTED parent centers on that
+    # parent's true baseline rather than the parent's own batch mean - see
+    # simulate_node's docstring for why that distinction matters.
+    baseline_means = {node: coefficients[node]["intercept"] for node in sorted_nodes}
+
+    # A node's batch mean no longer estimates its own baseline once its
+    # distribution has been shifted by an intervention - either directly (it's
+    # in `intervention`) or by inheriting the shift from an upstream ancestor
+    # (it's a descendant of some intervened node). Every such "shifted" node's
+    # CHILDREN must center on its baseline, not its batch mean, or the shift
+    # cancels itself out one hop further downstream than where it was applied.
+    shifted_nodes = set(intervention.keys())
+    for iv_node in intervention:
+        if iv_node in graph:
+            shifted_nodes |= nx.descendants(graph, iv_node)
+
     if verbose:
         print("simulating data...")
     for node in sorted_nodes:
@@ -213,7 +232,14 @@ def simulate_data(
         else:
             temp_int = None
 
-        data[node] = simulate_node(data, node_coefficients, n, cell_type, temp_int, node)
+        parents = [p for p in node_coefficients if p not in ("intercept", "error", "cell_type")]
+        parent_centers = {
+            p: (baseline_means[p] if p in shifted_nodes else data[p].mean()) for p in parents
+        }
+
+        data[node] = simulate_node(
+            data, node_coefficients, n, cell_type, temp_int, node, parent_centers=parent_centers
+        )
 
     if cell_type:
         data["cell_type"] = np.repeat([i for i in range(n_cells)], n // n_cells)
@@ -384,6 +410,7 @@ def simulate_node(
     cell_type: bool,
     intervention: Optional[float],
     node_name: str,
+    parent_centers: Optional[Dict[str, float]] = None,
 ) -> np.ndarray:
     """
     Simulate data for a single node using its structural equation.
@@ -409,6 +436,26 @@ def simulate_node(
         If provided, overrides structural equation simulation.
     node_name : str
         Name of the node being simulated (used for special output handling)
+    parent_centers : Optional[Dict[str, float]], default=None
+        Value to mean-center each parent on, keyed by parent name. If a parent
+        is omitted (or this is None), falls back to that parent's own batch
+        mean (``data[parent].mean()``) - the original, pre-existing behavior.
+
+        This must be set to the parent's TRUE observational baseline (its own
+        ``intercept`` - see ``simulate_data``'s ``baseline_means``) for any
+        parent whose distribution has been shifted by an intervention -
+        either directly (the parent itself was intervened upon) or by
+        inheriting the shift from an upstream ancestor that was. Such a
+        parent's own batch mean no longer estimates its true baseline (an
+        intervened parent's column is a constant equal to the intervention
+        value, so its batch mean IS that constant), so centering on it would
+        make ``data[parent] - data[parent].mean()`` identically zero for
+        every row, discarding the shift's effect on this node entirely -
+        whether that shift originated here or several hops upstream. For a
+        parent whose distribution was never touched by any intervention, its
+        own batch mean remains the right choice (self-corrects for
+        finite-sample deviation from that parent's true intercept, which is
+        the point of mean-centering at all).
 
     Returns
     -------
@@ -471,8 +518,16 @@ def simulate_node(
 
     for parent in parents:
         # Mean-center parent values so the intercept always represents the
-        # expected value of this node regardless of cascade depth.
-        node_data += coefficients[parent] * (data[parent] - data[parent].mean())
+        # expected value of this node regardless of cascade depth. Center on
+        # parent_centers[parent] when given (needed for an intervened parent -
+        # see this function's docstring); otherwise fall back to the parent's
+        # own batch mean, exactly as before this parameter existed.
+        center = (
+            parent_centers[parent]
+            if parent_centers is not None and parent in parent_centers
+            else data[parent].mean()
+        )
+        node_data += coefficients[parent] * (data[parent] - center)
 
     if cell_type & ("cell_type" in coefficients.keys()):
         ## add in cell_effect

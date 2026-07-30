@@ -609,9 +609,7 @@ class LVM:
 
         # Guide-agnostic per-site point estimates, keyed by model site name.
         # Every Pyro AutoGuide (including AutoGuideList) implements median().
-        self.guide_medians = {
-            site: value.detach() for site, value in self.guide.median().items()
-        }
+        self.guide_medians = {site: value.detach() for site, value in self.guide.median().items()}
 
         # Coefficient table: the scalar structural parameters (intercepts,
         # coefficients, scales). The per-observation imputation latents are
@@ -1015,9 +1013,7 @@ class LVM:
 
             # Extract imputation latents by model site name, which works for any
             # guide (parsing the param-store prefix only worked for AutoDelta).
-            imputation_param_keys = [
-                site for site in self.guide_medians if site.endswith("_real")
-            ]
+            imputation_param_keys = [site for site in self.guide_medians if site.endswith("_real")]
 
             if imputation_param_keys:
                 # Create dataframe of imputation values

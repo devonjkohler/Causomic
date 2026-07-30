@@ -198,3 +198,74 @@ def test_query_forward_paths_counts_mediators_not_edges():
         ("A", "B"),
         ("B", "C"),
     }
+
+
+def _make_weak_chain_graph():
+    # A -> B -> C, each edge with weak evidence (2) that only clears a
+    # depth-1 (1-mediator) threshold of 1, not a depth-0 (direct) threshold
+    # of 5.
+    G = nx.DiGraph()
+    for u, v in [("A", "B"), ("B", "C")]:
+        G.add_edge(
+            u,
+            v,
+            evidence={
+                "total_evidence": 2,
+                "source_evidence": 1,
+                "stmt_type": ["IncreaseAmount"],
+            },
+        )
+    return G
+
+
+def test_query_forward_paths_default_excludes_other_start_as_mediator():
+    # Regression/documentation: when start_nodes == end_nodes (the
+    # closed-neighborhood case), the default exclude_other_starts=True drops
+    # every other list member as a candidate mediator for a given pair, so a
+    # real A->B->C relationship that only clears the threshold at the
+    # 1-mediator depth is missed entirely: the (A, B) and (B, C) rounds
+    # reject it at their own direct (depth-0) threshold, and the (A, C)
+    # round can't route through the excluded node B.
+    G = _make_weak_chain_graph()
+    nodes = ["A", "B", "C"]
+
+    result = utils_nx.query_forward_paths(
+        G,
+        start_nodes=nodes,
+        end_nodes=nodes,
+        n_mediators=1,
+        med_ev_filter=[5, 1],
+    )
+    assert result.empty
+
+
+def test_query_neighborhood_paths_allows_internal_mediators():
+    # Same graph/thresholds as above, but via query_neighborhood_paths
+    # (exclude_other_starts=False): B is now a valid mediator between A and
+    # C, so both edges on the chain are recovered.
+    G = _make_weak_chain_graph()
+    nodes = ["A", "B", "C"]
+
+    result = utils_nx.query_neighborhood_paths(
+        G,
+        nodes,
+        n_mediators=1,
+        med_ev_filter=[5, 1],
+    )
+    assert set(zip(result["source"], result["target"])) == {
+        ("A", "B"),
+        ("B", "C"),
+    }
+
+    # Equivalent to calling query_forward_paths directly with the flag off.
+    direct = utils_nx.query_forward_paths(
+        G,
+        start_nodes=nodes,
+        end_nodes=nodes,
+        n_mediators=1,
+        med_ev_filter=[5, 1],
+        exclude_other_starts=False,
+    )
+    assert set(zip(direct["source"], direct["target"])) == set(
+        zip(result["source"], result["target"])
+    )

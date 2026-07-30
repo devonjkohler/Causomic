@@ -125,8 +125,13 @@ def test_simulate_data_intervention_propagates_to_direct_child():
     """
     G = chain_graph()
     out = ps.simulate_data(
-        G, coefficients=_chain_coefficients(), n=5000, seed=1,
-        intervention={"Y": 40.0}, add_feature_var=False, verbose=False,
+        G,
+        coefficients=_chain_coefficients(),
+        n=5000,
+        seed=1,
+        intervention={"Y": 40.0},
+        add_feature_var=False,
+        verbose=False,
     )
     expected_z = 5.0 + 0.8 * (40.0 - 10.0)  # Y's baseline intercept is 10.0
     assert np.isclose(out["Protein_data"]["Y"].mean(), 40.0)
@@ -142,8 +147,13 @@ def test_simulate_data_intervention_propagates_through_grandchild():
     """
     G = chain_graph()
     out = ps.simulate_data(
-        G, coefficients=_chain_coefficients(), n=5000, seed=1,
-        intervention={"X": 30.0}, add_feature_var=False, verbose=False,
+        G,
+        coefficients=_chain_coefficients(),
+        n=5000,
+        seed=1,
+        intervention={"X": 30.0},
+        add_feature_var=False,
+        verbose=False,
     )
     expected_y = 10.0 + 1.5 * (30.0 - 20.0)  # X's baseline intercept is 20.0
     expected_z = 5.0 + 0.8 * (expected_y - 10.0)

@@ -681,9 +681,9 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
         self.scale_with_n = scale_with_n
         self.interventional = interventional
         if arm_labels is not None:
-            assert arm_labels.index.equals(data.index), (
-                "arm_labels must share data's index (one label per row of data)."
-            )
+            assert arm_labels.index.equals(
+                data.index
+            ), "arm_labels must share data's index (one label per row of data)."
         self.arm_labels = arm_labels
         self.clamped_nodes = clamped_nodes or {}
 
@@ -790,7 +790,8 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
         full parent set - treated as a degenerate fit, not raised on).
         """
         contributing_arms = [
-            arm for arm in pd.unique(self.arm_labels)
+            arm
+            for arm in pd.unique(self.arm_labels)
             if variable not in self.clamped_nodes.get(arm, [])
         ]
         if not contributing_arms:
@@ -1087,7 +1088,10 @@ def process_bootstrap(
             interventional=True, arm_labels=resampled_arm_labels, clamped_nodes=clamped_nodes
         )
     custom_score = score_fn(
-        resampled_data, edge_priors=edge_priors, prior_strength=prior_strength, **interventional_kwargs
+        resampled_data,
+        edge_priors=edge_priors,
+        prior_strength=prior_strength,
+        **interventional_kwargs,
     )
 
     allowed = set(edge_priors.keys())

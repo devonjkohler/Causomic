@@ -232,15 +232,14 @@ def simulate_data(
         else:
             temp_int = None
 
-        parents = [
-            p for p in node_coefficients if p not in ("intercept", "error", "cell_type")
-        ]
+        parents = [p for p in node_coefficients if p not in ("intercept", "error", "cell_type")]
         parent_centers = {
             p: (baseline_means[p] if p in shifted_nodes else data[p].mean()) for p in parents
         }
 
-        data[node] = simulate_node(data, node_coefficients, n, cell_type, temp_int, node,
-                                    parent_centers=parent_centers)
+        data[node] = simulate_node(
+            data, node_coefficients, n, cell_type, temp_int, node, parent_centers=parent_centers
+        )
 
     if cell_type:
         data["cell_type"] = np.repeat([i for i in range(n_cells)], n // n_cells)

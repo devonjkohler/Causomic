@@ -33,6 +33,7 @@ the information to prefer A->B in a full-graph comparison. These tests
 therefore only assert the robust part (B->C recovered, C->B never appears) -
 see the local_score-level test for the full orientation-identification claim.
 """
+
 import importlib
 
 import numpy as np
@@ -177,18 +178,30 @@ def test_estimate_posterior_dag_consensus_subsample_frac_override():
 
     with patch.object(net, "run_bootstrap", wraps=net.run_bootstrap) as spy:
         net.estimate_posterior_dag(
-            data.copy(), indra_priors, prior_strength=5.0,
-            scoring_function=pdr.BICGaussIndraPriors, search_algorithm=pdr.SparseHillClimb,
-            n_bootstrap=5, edge_probability=0.5, selection="consensus", verbose=False,
+            data.copy(),
+            indra_priors,
+            prior_strength=5.0,
+            scoring_function=pdr.BICGaussIndraPriors,
+            search_algorithm=pdr.SparseHillClimb,
+            n_bootstrap=5,
+            edge_probability=0.5,
+            selection="consensus",
+            verbose=False,
             consensus_subsample_frac=1.0,
         )
         assert spy.call_args.kwargs["subsample_frac"] == 1.0
 
     with patch.object(net, "run_bootstrap", wraps=net.run_bootstrap) as spy:
         net.estimate_posterior_dag(
-            data.copy(), indra_priors, prior_strength=5.0,
-            scoring_function=pdr.BICGaussIndraPriors, search_algorithm=pdr.SparseHillClimb,
-            n_bootstrap=5, edge_probability=0.5, selection="consensus", verbose=False,
+            data.copy(),
+            indra_priors,
+            prior_strength=5.0,
+            scoring_function=pdr.BICGaussIndraPriors,
+            search_algorithm=pdr.SparseHillClimb,
+            n_bootstrap=5,
+            edge_probability=0.5,
+            selection="consensus",
+            verbose=False,
         )
         assert spy.call_args.kwargs["subsample_frac"] == 0.65
 

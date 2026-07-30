@@ -377,9 +377,7 @@ def test_bic_gauss_indra_priors_interventional_identifies_chain_orientation():
     reverse_chain = {"C": [], "B": ["C"], "A": ["B"]}
 
     # Observational-only: the two Markov-equivalent hypotheses tie exactly.
-    scorer_obs = pdr.BICGaussIndraPriors(
-        data.loc[arm_labels == "obs"], edge_priors=edge_priors
-    )
+    scorer_obs = pdr.BICGaussIndraPriors(data.loc[arm_labels == "obs"], edge_priors=edge_priors)
     score_true_obs = total_score(scorer_obs, true_chain)
     score_reverse_obs = total_score(scorer_obs, reverse_chain)
     assert score_true_obs == pytest.approx(score_reverse_obs, abs=1e-6)
@@ -424,15 +422,17 @@ def test_resample_with_arm_floor_keeps_small_arm_intact_across_seeds():
     big_arm_varied = False
     for seed in range(20):
         resampled = pdr._resample_with_arm_floor(
-            combined, "__arm_label__", frac=0.65, replace=True, floor=10,
+            combined,
+            "__arm_label__",
+            frac=0.65,
+            replace=True,
+            floor=10,
             rng=np.random.RandomState(seed),
         )
         resampled_small = resampled[resampled["__arm_label__"] == "small"]
         # The small (3-row) arm is below the floor=10 threshold: every one of its
         # rows must appear, unresampled, exactly once, every single time.
-        pd.testing.assert_frame_equal(
-            resampled_small.sort_index(), small_rows.sort_index()
-        )
+        pd.testing.assert_frame_equal(resampled_small.sort_index(), small_rows.sort_index())
         resampled_big = resampled[resampled["__arm_label__"] == "big"]
         # The big (20-row) arm is at/above the floor: it IS bootstrap-resampled,
         # so it should vary across seeds (and not always be all 20 original rows).
@@ -444,7 +444,11 @@ def test_resample_with_arm_floor_keeps_small_arm_intact_across_seeds():
 def test_resample_with_arm_floor_all_arms_above_floor_resamples_everything():
     combined = _combined_big_small(n_big=20, n_small=12)
     resampled = pdr._resample_with_arm_floor(
-        combined, "__arm_label__", frac=0.5, replace=True, floor=10,
+        combined,
+        "__arm_label__",
+        frac=0.5,
+        replace=True,
+        floor=10,
         rng=np.random.RandomState(0),
     )
     # Both arms are >= floor=10, so both get bootstrap-resampled to round(frac*len).

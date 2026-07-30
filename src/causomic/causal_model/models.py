@@ -92,6 +92,11 @@ class ProteomicPerturbationModel(PyroModule):
         downstream_coef_dict_scale: Dict[str, torch.Tensor] = dict()
         root_coef_dict_mean: Dict[str, torch.Tensor] = dict()
         root_coef_dict_scale: Dict[str, torch.Tensor] = dict()
+        # Measurement-error scales: one per node, sampled outside the observation
+        # plate so that all n_obs observations inform a single parameter. Sampling
+        # these inside the plate makes the MAP objective unbounded (set
+        # {node}_real == obs and let obs_eps -> 0).
+        obs_eps_dict: Dict[str, torch.Tensor] = dict()
 
         # Initial priors for coefficients
         for node_name, items in self.downstream_nodes.items():
@@ -119,6 +124,12 @@ class ProteomicPerturbationModel(PyroModule):
                     f"{node_name}_scale", pyro_dist.Exponential(torch.tensor(1.0, device=device))
                 )
 
+                if f"obs_{node_name}" in data:
+                    obs_eps_dict[node_name] = pyro.sample(
+                        f"{node_name}_obs_eps",
+                        pyro_dist.HalfCauchy(torch.tensor(0.1, device=device)),
+                    )
+
         for node_name in self.root_nodes:
             root_coef_dict_mean[f"{node_name}_int"] = pyro.sample(
                 f"{node_name}_int",
@@ -131,6 +142,12 @@ class ProteomicPerturbationModel(PyroModule):
             root_coef_dict_scale[f"{node_name}_scale"] = pyro.sample(
                 f"{node_name}_scale", pyro_dist.Exponential(torch.tensor(1.0, device=device))
             )
+
+            if f"obs_{node_name}" in data:
+                obs_eps_dict[node_name] = pyro.sample(
+                    f"{node_name}_obs_eps",
+                    pyro_dist.HalfCauchy(torch.tensor(0.1, device=device)),
+                )
 
         # Loop through the data
         downstream_distributions: Dict[str, torch.Tensor] = dict()
@@ -147,10 +164,7 @@ class ProteomicPerturbationModel(PyroModule):
                 if f"obs_{node_name}" in data:
 
                     x = pyro.sample(f"{node_name}_real", pyro_dist.Normal(mean, scale))
-                    obs_eps = pyro.sample(
-                        f"{node_name}_obs_eps",
-                        pyro_dist.HalfCauchy(torch.tensor(0.1, device=device)),
-                    )
+                    obs_eps = obs_eps_dict[node_name]
 
                     mask = ~data[f"missing_{node_name}"].bool()
 
@@ -192,10 +206,7 @@ class ProteomicPerturbationModel(PyroModule):
                         y = pyro.sample(f"{node_name}_real", pyro_dist.Normal(mean, scale))
 
                         mask = ~data[f"missing_{node_name}"].bool()
-                        obs_eps = pyro.sample(
-                            f"{node_name}_obs_eps",
-                            pyro_dist.HalfCauchy(torch.tensor(0.1, device=device)),
-                        )
+                        obs_eps = obs_eps_dict[node_name]
 
                         # Clamp only observed entries
                         with poutine.mask(mask=mask):

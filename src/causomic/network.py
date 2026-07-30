@@ -59,6 +59,7 @@ from causomic.graph_construction.prior_data_reconciliation import (
     calculate_edge_probabilities,
     prepare_indra_priors,
     run_bootstrap,
+    run_dagma,
 )
 from causomic.graph_construction.repair import convert_to_y0_graph, process_failed_test
 from causomic.graph_construction.utils_neo4j import (
@@ -385,6 +386,12 @@ def estimate_posterior_dag(
     return_bootstrap_dags: bool = False,
     random_init: bool = False,
     selection: str = "best_of",
+    dagma_lambda1: float = 0.02,
+    dagma_w_threshold: float = 0.2,
+    dagma_loss_type: str = "l2",
+    dagma_evidence_clip: float = 3.0,
+    dagma_evidence_center: bool = False,
+    dagma_fit_kwargs: Optional[dict] = None,
     return_runs: bool = False,
     verbose: bool = True,
     interventional: bool = False,
@@ -454,6 +461,62 @@ def estimate_posterior_dag(
         If True, initialize each bootstrap hill climb from a random acyclic subgraph
         rather than an empty DAG. This can help escape local optima at the cost of
         increased run-to-run variability. Default is False.
+
+    selection : str, optional
+        How to reduce candidate DAGs to a single posterior DAG. One of:
+        - "best_of": n_bootstrap random-restart hill climbs on the full data;
+          keep the highest-scoring acyclic DAG (uses scoring_function/search_algorithm).
+        - "consensus": bootstrap resamples + >=edge_probability edge vote
+          (uses scoring_function/search_algorithm).
+        - "dagma": a single DAGMA continuous-optimization fit on the full data,
+          hard-restricted to edges present in indra_priors (see dagma_lambda1,
+          dagma_w_threshold, dagma_loss_type). scoring_function, search_algorithm,
+          n_bootstrap, edge_probability, and random_init are ignored in this mode;
+          edge_prob is set to 1.0 for every returned edge.
+        - "dagma_weighted": same as "dagma", but additionally scales the L1
+          penalty per allowed edge by its INDRA evidence log-odds (see
+          dagma_evidence_clip, dagma_evidence_center): edges with strong
+          evidence face a smaller effective penalty, weak-evidence edges a
+          larger one. This is the DAGMA analogue of how BICGaussIndraPriors
+          combines a hard allowed-edge restriction with a soft log-odds bonus
+          for SparseHillClimb.
+        Default is "best_of".
+
+    dagma_lambda1 : float, optional
+        L1 sparsity penalty for DAGMA's structural loss. Only used when
+        selection is "dagma" or "dagma_weighted". Default is 0.02.
+
+    dagma_w_threshold : float, optional
+        Post-hoc weight threshold for DAGMA's estimated adjacency matrix; entries
+        with magnitude below this are zeroed out. Only used when selection is
+        "dagma" or "dagma_weighted". Default is 0.2.
+
+    dagma_loss_type : str, optional
+        Loss type passed to DAGMA's DagmaLinear estimator. Only used when
+        selection is "dagma" or "dagma_weighted". Default is "l2".
+
+    dagma_evidence_clip : float, optional
+        Bounds the per-edge evidence log-odds before exponentiating into a
+        penalty multiplier, so a single very strong/weak prior can't dominate.
+        Only used when selection="dagma_weighted". Default is 3.0.
+
+    dagma_evidence_center : bool, optional
+        If True, center the per-edge log-odds by their mean (over prior-covered
+        edges) before computing the penalty multiplier, so the penalty is
+        relative to the average prior strength in this graph rather than to
+        p=0.5. Only used when selection="dagma_weighted". Default is False.
+
+    dagma_fit_kwargs : dict, optional
+        Extra keyword arguments forwarded to DAGMA's DagmaLinear.fit, most
+        usefully its convergence schedule (T, warm_iter, max_iter, mu_init,
+        mu_factor, s, lr, ...). DAGMA's defaults (T=5, warm_iter=3e4,
+        max_iter=6e4) assume a cheap per-iteration cost, but each iteration
+        does a dense (d, d) matrix inversion, so wall-clock time scales with
+        the number of data columns regardless of how few edges the INDRA
+        prior allows. For graphs of a few hundred nodes or more, a lighter
+        schedule (e.g. {"T": 3, "warm_iter": 3000, "max_iter": 6000}) is
+        often necessary. Only used when selection is "dagma" or
+        "dagma_weighted". Default is None (DagmaLinear.fit's own defaults).
 
     interventional : bool, optional
         If True (and `arm_labels` is given), every scorer constructed inside this
@@ -582,57 +645,84 @@ def estimate_posterior_dag(
     #                            (use a BIC scoring_function to control false edges).
     #   selection="consensus" -> bootstrap resamples + >=edge_probability edge vote
     #                            (the original behaviour).
+    #   selection="dagma"     -> a single DAGMA continuous-optimization fit on the
+    #                            full data, hard-restricted to indra_priors edges.
+    #   selection="dagma_weighted" -> same as "dagma", plus a per-edge L1 penalty
+    #                            scaled by INDRA evidence log-odds.
     # ------------------------------------------------------------------
-    if selection == "best_of":
-        run_frac, run_replace, run_random_init = 1.0, False, True
-    elif selection == "consensus":
-        run_frac, run_replace, run_random_init = 0.65, True, random_init
-        if consensus_subsample_frac is not None:
-            run_frac = consensus_subsample_frac
-    else:
-        raise ValueError(f"Unknown selection={selection!r}; use 'best_of' or 'consensus'.")
-
-    # Run the search to generate multiple DAG hypotheses
-    bootstrap_dags = run_bootstrap(
-        data,
-        indra_priors,
-        prior_strength,
-        scoring_function,
-        search_algorithm,
-        expert_knowledge,
-        add_high_corr_edges_to_priors,
-        corr_threshold,
-        n_bootstrap,
-        convert_to_probability,
-        use_source_counts,
-        run_random_init,
-        subsample_frac=run_frac,
-        replace=run_replace,
-        verbose=verbose,
-        interventional=interventional,
-        arm_labels=arm_labels,
-        clamped_nodes=clamped_nodes,
-        arm_resample_floor=arm_resample_floor,
-    )
-
-    # Reduce the runs to one posterior DAG
     run_scores = None
-    if selection == "best_of":
-        edge_priors = prepare_indra_priors(indra_priors, convert_to_probability, use_source_counts)
-        best_dag, run_scores = best_scoring_dag(
-            bootstrap_dags,
+    if selection in ("dagma", "dagma_weighted"):
+        dagma_dag = run_dagma(
             data,
-            edge_priors,
-            scoring_function,
+            indra_priors,
+            lambda1=dagma_lambda1,
+            w_threshold=dagma_w_threshold,
+            loss_type=dagma_loss_type,
+            use_evidence_weights=(selection == "dagma_weighted"),
+            convert_to_probability=convert_to_probability,
+            use_source_counts=use_source_counts,
+            evidence_clip=dagma_evidence_clip,
+            evidence_center=dagma_evidence_center,
+            dagma_fit_kwargs=dagma_fit_kwargs,
+            verbose=verbose,
+        )
+        bootstrap_dags = [dagma_dag]
+        posterior_dag = pd.DataFrame(list(dagma_dag.edges()), columns=["source", "target"])
+    else:
+        if selection == "best_of":
+            run_frac, run_replace, run_random_init = 1.0, False, True
+        elif selection == "consensus":
+            run_frac, run_replace, run_random_init = 0.65, True, random_init
+            if consensus_subsample_frac is not None:
+                run_frac = consensus_subsample_frac
+        else:
+            raise ValueError(
+                f"Unknown selection={selection!r}; use 'best_of', 'consensus', 'dagma', "
+                "or 'dagma_weighted'."
+            )
+
+        # Run the search to generate multiple DAG hypotheses
+        bootstrap_dags = run_bootstrap(
+            data,
+            indra_priors,
             prior_strength,
+            scoring_function,
+            search_algorithm,
+            expert_knowledge,
+            add_high_corr_edges_to_priors,
+            corr_threshold,
+            n_bootstrap,
+            convert_to_probability,
+            use_source_counts,
+            run_random_init,
+            subsample_frac=run_frac,
+            replace=run_replace,
+            verbose=verbose,
             interventional=interventional,
             arm_labels=arm_labels,
             clamped_nodes=clamped_nodes,
+            arm_resample_floor=arm_resample_floor,
         )
-        posterior_dag = pd.DataFrame(list(best_dag.edges()), columns=["source", "target"])
-    else:
-        cons = consensus_dag(bootstrap_dags, indra_priors, lam=0.25, min_freq=edge_probability)
-        posterior_dag = pd.DataFrame(list(cons.edges()), columns=["source", "target"])
+
+        # Reduce the runs to one posterior DAG
+        if selection == "best_of":
+            edge_priors = prepare_indra_priors(
+                indra_priors, convert_to_probability, use_source_counts
+            )
+            best_dag, run_scores = best_scoring_dag(
+                bootstrap_dags,
+                data,
+                edge_priors,
+                scoring_function,
+                prior_strength,
+                interventional=interventional,
+                arm_labels=arm_labels,
+                clamped_nodes=clamped_nodes,
+            )
+            posterior_dag = pd.DataFrame(list(best_dag.edges()), columns=["source", "target"])
+        else:
+            cons = consensus_dag(bootstrap_dags, indra_priors, lam=0.25, min_freq=edge_probability)
+            posterior_dag = pd.DataFrame(list(cons.edges()), columns=["source", "target"])
 
     # Convert posterior DAG to y0 graph format
     y0_graph = convert_to_y0_graph(posterior_dag)

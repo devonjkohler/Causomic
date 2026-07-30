@@ -1695,7 +1695,9 @@ def run_dagma(
         cleaned_priors = indra_priors.copy()
         cleaned_priors["source"] = cleaned_priors["source"].astype(str).str.replace("-", "")
         cleaned_priors["target"] = cleaned_priors["target"].astype(str).str.replace("-", "")
-        edge_priors = prepare_indra_priors(cleaned_priors, convert_to_probability, use_source_counts)
+        edge_priors = prepare_indra_priors(
+            cleaned_priors, convert_to_probability, use_source_counts
+        )
         belief, mask = _build_dagma_belief_matrix(node_order, edge_priors)
         penalty_weights = evidence_penalty(belief, mask, clip=evidence_clip, center=evidence_center)
 

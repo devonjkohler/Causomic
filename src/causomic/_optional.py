@@ -13,7 +13,19 @@ COGEX_INSTALL_HINT = (
     "    pip install git+https://github.com/gyorilab/indra_cogex.git"
 )
 
+DAGMA_INSTALL_HINT = (
+    "This feature requires the optional 'dagma' dependency. Install it with:\n"
+    "    pip install causomic[dagma]\n"
+    "or directly with:\n"
+    "    pip install dagma"
+)
+
 
 def missing_cogex(*_args, **_kwargs):
     """Placeholder for indra-cogex symbols; raises a helpful error when used."""
     raise ImportError(COGEX_INSTALL_HINT)
+
+
+def missing_dagma(*_args, **_kwargs):
+    """Placeholder for dagma symbols; raises a helpful error when used."""
+    raise ImportError(DAGMA_INSTALL_HINT)

@@ -3,15 +3,19 @@
 Covers the causal-path filtering used to prune a posterior graph down to the
 nodes relevant to a treatment/outcome query, and the consensus-DAG aggregation
 that turns a set of bootstrap DAGs plus edge priors into a single acyclic graph.
-The INDRA/bootstrap-driven entry points (extract_indra_prior,
-estimate_posterior_dag, repair_confounding) require external services and are
-not exercised here.
+extract_indra_prior and repair_confounding require external services and are
+not exercised here. estimate_posterior_dag's hill-climb-driven selections
+("best_of"/"consensus") are too heavy for unit tests, but its "dagma" selection
+is a single, cheap continuous-optimization fit and is exercised below (gated
+behind pytest.importorskip("dagma") since it's an optional dependency).
 """
 
 import importlib
 
 import networkx as nx
+import numpy as np
 import pandas as pd
+import pytest
 from y0.dsl import Variable
 from y0.graph import NxMixedGraph
 
@@ -137,3 +141,75 @@ def test_consensus_dag_ignores_none_entries():
     out = net.consensus_dag(dags, priors, min_freq=0.5)
     # Only one valid DAG, edge freq 1.0.
     assert ("X", "Y") in out.edges()
+
+
+def test_estimate_posterior_dag_dagma_selection_restricts_to_prior_edges():
+    pytest.importorskip("dagma")
+
+    rng = np.random.default_rng(0)
+    n = 500
+    A = rng.normal(size=n)
+    B = 2.0 * A + rng.normal(scale=0.1, size=n)
+    C = rng.normal(size=n)  # independent noise, absent from the prior
+    data = pd.DataFrame({"A": A, "B": B, "C": C})
+
+    indra_priors = pd.DataFrame({"source": ["A"], "target": ["B"], "evidence_count": [10]})
+
+    y0_graph, bootstrap_dags = net.estimate_posterior_dag(
+        data,
+        indra_priors,
+        selection="dagma",
+        return_bootstrap_dags=True,
+        verbose=False,
+    )
+
+    edges = {(str(u), str(v)) for u, v in y0_graph.directed.edges()}
+    assert edges == {("A", "B")}
+    # Single deterministic full-data fit -> exactly one candidate DAG.
+    assert len(bootstrap_dags) == 1
+    for u, v in y0_graph.directed.edges():
+        assert y0_graph.directed[u][v]["edge_prob"] == 1.0
+
+
+def test_estimate_posterior_dag_dagma_weighted_selection_uses_evidence_strength():
+    pytest.importorskip("dagma")
+
+    # Two structurally identical edges (A->B, C->D); only the INDRA evidence
+    # strength differs. At this lambda1, plain "dagma" keeps both, but
+    # "dagma_weighted" should favor the well-evidenced edge and drop the
+    # poorly-evidenced one despite the identical true effect size.
+    rng = np.random.default_rng(0)
+    n = 400
+    A = rng.normal(size=n)
+    C = rng.normal(size=n)
+    coef = 0.5
+    B = coef * A + rng.normal(scale=1.0, size=n)
+    D = coef * C + rng.normal(scale=1.0, size=n)
+    data = pd.DataFrame({"A": A, "B": B, "C": C, "D": D})
+
+    indra_priors = pd.DataFrame(
+        {"source": ["A", "C"], "target": ["B", "D"], "evidence_count": [50, 1]}
+    )
+
+    y0_plain = net.estimate_posterior_dag(
+        data.copy(),
+        indra_priors.copy(),
+        selection="dagma",
+        dagma_lambda1=0.3,
+        dagma_w_threshold=0.1,
+        verbose=False,
+    )
+    y0_weighted = net.estimate_posterior_dag(
+        data.copy(),
+        indra_priors.copy(),
+        selection="dagma_weighted",
+        dagma_lambda1=0.3,
+        dagma_w_threshold=0.1,
+        verbose=False,
+    )
+
+    plain_edges = {(str(u), str(v)) for u, v in y0_plain.directed.edges()}
+    weighted_edges = {(str(u), str(v)) for u, v in y0_weighted.directed.edges()}
+
+    assert plain_edges == {("A", "B"), ("C", "D")}
+    assert weighted_edges == {("A", "B")}

@@ -302,6 +302,7 @@ def best_scoring_dag(
     interventional: bool = False,
     arm_labels=None,
     clamped_nodes=None,
+    pooled_interventional: bool = False,
 ):
     """Select the single highest-scoring acyclic DAG from candidate runs.
 
@@ -334,6 +335,11 @@ def best_scoring_dag(
         (never resampled), so ``arm_labels`` is passed through unmodified.
     clamped_nodes : Optional[dict], optional
         Forwarded to ``scoring_function`` unchanged when ``interventional`` is True.
+    pooled_interventional : bool, optional
+        Forwarded to ``scoring_function`` (only when ``interventional`` is True) to
+        select the pooled single-GLM interventional score over the per-arm one -
+        see ``BICGaussIndraPriors._local_score_interventional_pooled``. Default
+        False reproduces the per-arm behavior exactly.
 
     Returns
     -------
@@ -345,7 +351,10 @@ def best_scoring_dag(
     interventional_kwargs = {}
     if interventional:
         interventional_kwargs = dict(
-            interventional=True, arm_labels=arm_labels, clamped_nodes=clamped_nodes
+            interventional=True,
+            arm_labels=arm_labels,
+            clamped_nodes=clamped_nodes,
+            pooled_interventional=pooled_interventional,
         )
     scorer = scoring_function(
         data, edge_priors=edge_priors, prior_strength=prior_strength, **interventional_kwargs
@@ -397,6 +406,7 @@ def estimate_posterior_dag(
     interventional: bool = False,
     arm_labels: Optional[pd.Series] = None,
     clamped_nodes: Optional[dict] = None,
+    pooled_interventional: bool = False,
     arm_resample_floor: int = 0,
     consensus_subsample_frac: Optional[float] = None,
 ) -> NxMixedGraph:
@@ -538,6 +548,20 @@ def estimate_posterior_dag(
         Maps an arm label (as found in `arm_labels`) to the list of node names
         pharmacologically clamped in that arm. Forwarded unchanged wherever
         `interventional` is active - see `BICGaussIndraPriors`.
+
+    pooled_interventional : bool, optional
+        Only meaningful when `interventional` is active. If True, every scorer
+        constructed inside this call (in `run_bootstrap` and, for
+        `selection="best_of"`, in `best_scoring_dag`) fits ONE pooled GLM over all
+        rows where the scored variable is not clamped, with a single intercept,
+        instead of one GLM per arm. The per-arm path gives each arm its own free
+        intercept, which absorbs that arm's mean shift in the scored variable -
+        i.e. the interventional signal that orients edges - so it is close to
+        uninformative about direction; it also undercounts the complexity penalty
+        by a factor of the arm count. Prefer True for designs with many small arms
+        (e.g. Perturb-seq pseudobulk). Default False reproduces the per-arm
+        behavior exactly, which published HPN-DREAM results depend on - see
+        `BICGaussIndraPriors._local_score_interventional_pooled`.
 
     arm_resample_floor : int, optional
         Only meaningful when `arm_labels` is not None and `selection="consensus"`
@@ -701,6 +725,7 @@ def estimate_posterior_dag(
             interventional=interventional,
             arm_labels=arm_labels,
             clamped_nodes=clamped_nodes,
+            pooled_interventional=pooled_interventional,
             arm_resample_floor=arm_resample_floor,
         )
 
@@ -718,6 +743,7 @@ def estimate_posterior_dag(
                 interventional=interventional,
                 arm_labels=arm_labels,
                 clamped_nodes=clamped_nodes,
+                pooled_interventional=pooled_interventional,
             )
             posterior_dag = pd.DataFrame(list(best_dag.edges()), columns=["source", "target"])
         else:

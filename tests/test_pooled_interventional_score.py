@@ -20,6 +20,7 @@ import logging
 
 import numpy as np
 import pandas as pd
+import pytest
 
 pdr = importlib.import_module("causomic.graph_construction.prior_data_reconciliation")
 
@@ -211,22 +212,36 @@ def test_default_construction_is_unchanged_by_the_new_flag():
     """A scorer built with no interventional kwargs returns the pre-change value.
 
     The literals below were captured from the observational code path at commit
-    e58b54c (before `pooled_interventional` existed) on this exact fixed data, and
-    reproduced bit-for-bit afterwards. They guard the requirement that nothing
-    changes unless the new flag is explicitly set to True.
+    e58b54c (before `pooled_interventional` existed) on this exact fixed data.
+    They guard the requirement that nothing changes unless the new flag is
+    explicitly set to True.
+
+    Compared with a relative tolerance rather than `==` because the underlying GLM
+    fit goes through whatever BLAS/LAPACK the platform provides, which reorders
+    floating-point reductions and shifts the last digit or two of the result (the
+    observed cross-platform spread is ~1e-16 relative, i.e. 1-2 ULP). `rel=1e-9`
+    is still many orders of magnitude tighter than any genuine behavior change -
+    reaching the wrong branch, mis-scaling the penalty, or retaining the wrong rows
+    all move these values by whole units or more - so it keeps the regression
+    guard's teeth while surviving a different BLAS build. Don't tighten this back
+    to exact equality.
     """
     data, _, _ = _two_node_scm()
     scorer = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS)
 
-    assert scorer.local_score("B", ["A"]) == -181.9218239637686
-    assert scorer.local_score("A", ["B"]) == -154.11763570887948
+    assert scorer.local_score("B", ["A"]) == pytest.approx(-181.9218239637686, rel=1e-9)
+    assert scorer.local_score("A", ["B"]) == pytest.approx(-154.11763570887948, rel=1e-9)
     # Default flag value must be off, so local_score never reaches the pooled branch.
     assert scorer.pooled_interventional is False
 
 
 def test_armwise_path_unchanged_when_flag_left_off():
     """With `pooled_interventional` unset, the interventional branch still produces
-    the per-arm value captured at commit e58b54c on this fixed data."""
+    the per-arm value captured at commit e58b54c on this fixed data.
+
+    See `test_default_construction_is_unchanged_by_the_new_flag` for why these are
+    compared with a relative tolerance instead of exact equality.
+    """
     data, arm_labels, clamped_nodes = _two_node_scm()
 
     scorer = pdr.BICGaussIndraPriors(
@@ -237,5 +252,5 @@ def test_armwise_path_unchanged_when_flag_left_off():
         clamped_nodes=clamped_nodes,
     )
 
-    assert scorer.local_score("B", ["A"]) == -42.70524914189197
-    assert _orientation_margin(scorer) == 6.02689564594472
+    assert scorer.local_score("B", ["A"]) == pytest.approx(-42.70524914189197, rel=1e-9)
+    assert _orientation_margin(scorer) == pytest.approx(6.02689564594472, rel=1e-9)

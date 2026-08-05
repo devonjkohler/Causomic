@@ -1,18 +1,20 @@
-"""Coverage for BICGaussIndraPriors._local_score_interventional_pooled, the opt-in
-(`pooled_interventional=True`) pooled interventional local score.
+"""Coverage for BICGaussIndraPriors._local_score_interventional, the pooled
+(Hauser-Buhlmann style) GIES interventional local score.
 
-The point of the pooled path is that it fits ONE GLM - and therefore estimates ONE
-intercept - over every row where the scored variable isn't clamped, instead of one
-GLM per experimental arm. Per-arm fits hand each arm its own free intercept, which
-absorbs that arm's mean shift in the scored variable; those between-arm mean shifts
-are exactly the interventional signal that orients an edge, so the per-arm path
-scores only within-arm covariance, which is symmetric in the two nodes of an edge
-and says nothing about direction.
+Its defining property is that it fits ONE GLM - and therefore estimates ONE
+intercept - over every row where the scored variable isn't clamped. Fitting per
+arm instead would hand each arm its own free intercept, and that intercept
+absorbs the arm's mean shift in the scored variable; those between-arm mean shifts
+are exactly the interventional signal that orients an edge, so a per-arm fit is
+left scoring only within-arm covariance, which is symmetric in the two nodes of an
+edge and says nothing about direction. An earlier per-arm implementation of this
+method was removed for that reason.
 
 These tests use a synthetic two-node SCM with a known direction (A -> B) and three
-arms, and check that the pooled path recovers the direction, that the per-arm path
-does not, that the pooled complexity penalty doesn't scale with the arm count, and
-that clamping is applied to the scored variable only (never to a parent).
+arms, and check that the score recovers the direction, that the complexity penalty
+depends only on the retained row count (not the arm count), that clamping applies
+to the scored variable only and never to a parent, and that with nothing clamped
+the score collapses exactly onto the flat observational score.
 """
 
 import importlib
@@ -58,14 +60,13 @@ def _two_node_scm(seed: int = 0, n_per_arm: int = 30):
     return data, arm_labels, CLAMPED_NODES
 
 
-def _scorer(data, arm_labels, clamped_nodes, pooled: bool):
+def _scorer(data, arm_labels, clamped_nodes):
     return pdr.BICGaussIndraPriors(
         data,
         edge_priors=EDGE_PRIORS,
         interventional=True,
         arm_labels=arm_labels,
         clamped_nodes=clamped_nodes,
-        pooled_interventional=pooled,
     )
 
 
@@ -81,49 +82,19 @@ def _orientation_margin(scorer) -> float:
     return true_dir - reverse_dir
 
 
-def test_pooled_score_orients_edge_correctly():
-    """The pooled path prefers the true A->B over B->A by a decisive margin."""
+def test_interventional_score_orients_edge_correctly():
+    """The pooled score prefers the true A->B over B->A by a decisive margin."""
     data, arm_labels, clamped_nodes = _two_node_scm()
 
-    margin = _orientation_margin(_scorer(data, arm_labels, clamped_nodes, pooled=True))
+    margin = _orientation_margin(_scorer(data, arm_labels, clamped_nodes))
 
-    # Observed ~ +108 at this seed; ~ +98 to +111 across seeds 0-4.
-    assert margin > 50.0, f"pooled score failed to orient A->B (margin={margin})"
-
-
-def test_armwise_score_does_not_orient_edge():
-    """Regression test DOCUMENTING A KNOWN LIMITATION of the per-arm path.
-
-    This asserts that the per-arm interventional score (`pooled_interventional=False`,
-    the default) does NOT meaningfully prefer the true orientation, because each arm's
-    own intercept absorbs that arm's mean shift in the scored variable and leaves only
-    direction-free within-arm covariance. That is the defect the pooled path exists to
-    fix - it is NOT a property we want, and it is NOT a test to "fix" by flipping the
-    comparison. If a future change makes the per-arm path orientation-aware, delete
-    this test deliberately with that reasoning; do not invert it to make it pass.
-
-    The per-arm margin at these seeds sits near zero and is sometimes negative (i.e.
-    it favors the WRONG orientation), which is why this only asserts the absence of a
-    meaningful preference rather than a particular sign.
-    """
-    data, arm_labels, clamped_nodes = _two_node_scm()
-
-    armwise_margin = _orientation_margin(_scorer(data, arm_labels, clamped_nodes, pooled=False))
-    pooled_margin = _orientation_margin(_scorer(data, arm_labels, clamped_nodes, pooled=True))
-
-    # Observed ~ +6 at this seed; ~ -5 to +9 across seeds 0-4, versus ~ +100 pooled.
-    assert armwise_margin < 25.0, (
-        "per-arm interventional score unexpectedly oriented the edge decisively "
-        f"(margin={armwise_margin}); see this test's docstring before changing it"
-    )
-    assert pooled_margin > armwise_margin + 50.0, (
-        f"pooled margin ({pooled_margin}) is not substantially larger than the "
-        f"per-arm margin ({armwise_margin})"
-    )
+    # Observed ~ +108 at this seed; ~ +98 to +111 across seeds 0-4. The removed
+    # per-arm implementation scored ~ +6 here, and went negative on some seeds.
+    assert margin > 50.0, f"failed to orient A->B (margin={margin})"
 
 
-def test_pooled_penalty_uses_retained_row_count():
-    """The pooled penalty is exactly ((df_model + 2)/2) * log(n_used).
+def test_penalty_uses_retained_row_count():
+    """The penalty is exactly ((df_model + 2)/2) * log(n_used).
 
     `n_used` is the number of retained rows (arms not clamping the scored variable),
     and the prior bonus is exactly 0 here, so the local score must equal
@@ -137,14 +108,14 @@ def test_pooled_penalty_uses_retained_row_count():
     ll, df_model = reference._log_likelihood(variable="B", parents=["A"])
     expected = ll - (((df_model + 2) / 2) * np.log(len(retained)))
 
-    pooled = _scorer(data, arm_labels, clamped_nodes, pooled=True)
-    assert pooled.local_score("B", ["A"]) == expected
+    assert _scorer(data, arm_labels, clamped_nodes).local_score("B", ["A"]) == expected
 
 
-def test_pooled_penalty_does_not_scale_with_arm_count():
-    """Splitting every arm into two identically-clamped halves leaves the pooled score
-    unchanged (same rows, same single fit, same penalty over the same `n_used`), while
-    the per-arm score shifts because it pays a fit - and an intercept - per arm."""
+def test_penalty_does_not_scale_with_arm_count():
+    """Splitting every arm into two identically-clamped halves leaves the score
+    unchanged: same rows retained, one fit either way, same penalty over the same
+    `n_used`. The removed per-arm implementation shifted by ~1.2 here, because it
+    paid an extra fit - and an extra intercept - per arm."""
     data, arm_labels, clamped_nodes = _two_node_scm()
 
     # Split each 30-row arm into two 15-row sub-arms carrying the same clamping.
@@ -159,20 +130,33 @@ def test_pooled_penalty_does_not_scale_with_arm_count():
     }
     assert len(pd.unique(split_labels)) == 2 * len(pd.unique(arm_labels))
 
-    pooled_before = _scorer(data, arm_labels, clamped_nodes, pooled=True).local_score("B", ["A"])
-    pooled_after = _scorer(data, split_labels, split_clamped, pooled=True).local_score("B", ["A"])
-    assert pooled_before == pooled_after, (
-        f"pooled score changed with arm count ({pooled_before} -> {pooled_after}); "
-        "the penalty must depend only on the retained row count"
+    before = _scorer(data, arm_labels, clamped_nodes).local_score("B", ["A"])
+    after = _scorer(data, split_labels, split_clamped).local_score("B", ["A"])
+    assert before == after, (
+        f"score changed with arm count ({before} -> {after}); the penalty must "
+        "depend only on the retained row count"
     )
 
-    armwise_before = _scorer(data, arm_labels, clamped_nodes, pooled=False).local_score("B", ["A"])
-    armwise_after = _scorer(data, split_labels, split_clamped, pooled=False).local_score("B", ["A"])
-    # Not a desired property - just pinning the contrast that motivates the pooled path.
-    assert armwise_before != armwise_after
+
+def test_score_reduces_to_observational_when_nothing_is_clamped():
+    """With no clamped nodes, the interventional score IS the flat observational
+    score - pooling means the arm partitioning alone never moves a score. This is
+    the invariant that replaced the removed per-arm path, which changed the score
+    (here by ~117) purely from how rows were grouped into arms, even with zero
+    interventions."""
+    data, arm_labels, _ = _two_node_scm()
+
+    flat = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS).local_score("B", ["A"])
+
+    # Multi-arm labels, but no clamps anywhere.
+    assert _scorer(data, arm_labels, {}).local_score("B", ["A"]) == flat
+    assert _scorer(data, arm_labels, None).local_score("B", ["A"]) == flat
+    # And a single all-observational arm.
+    one_arm = pd.Series(["obs"] * len(data), index=data.index)
+    assert _scorer(data, one_arm, {}).local_score("B", ["A"]) == flat
 
 
-def test_pooled_score_retains_rows_where_a_parent_is_clamped():
+def test_score_retains_rows_where_a_parent_is_clamped():
     """Clamping a *parent* must drop no rows and remove no regressor.
 
     A clamped parent's experimenter-set value is an ordinary regressor for another
@@ -181,7 +165,7 @@ def test_pooled_score_retains_rows_where_a_parent_is_clamped():
     the score against an explicit fit over exactly the rows that should be retained.
     """
     data, arm_labels, clamped_nodes = _two_node_scm()
-    pooled = _scorer(data, arm_labels, clamped_nodes, pooled=True)
+    scorer = _scorer(data, arm_labels, clamped_nodes)
 
     for variable, parent, clamping_arm in (("B", "A", "do_B"), ("A", "B", "do_A")):
         # Everything except the arm that clamps `variable` itself - which includes
@@ -195,26 +179,23 @@ def test_pooled_score_retains_rows_where_a_parent_is_clamped():
         ll, df_model = reference._log_likelihood(variable=variable, parents=[parent])
         expected = ll - (((df_model + 2) / 2) * np.log(len(retained)))
 
-        assert pooled.local_score(variable, [parent]) == expected
+        assert scorer.local_score(variable, [parent]) == expected
 
 
-def test_pooled_score_is_neg_inf_when_variable_clamped_in_every_arm():
+def test_score_is_neg_inf_when_variable_clamped_in_every_arm():
     """No arm carries information about a variable clamped everywhere -> -inf."""
     data, arm_labels, _ = _two_node_scm()
     clamped_everywhere = {arm: ["B"] for arm in pd.unique(arm_labels)}
 
-    pooled = _scorer(data, arm_labels, clamped_everywhere, pooled=True)
-
-    assert pooled.local_score("B", ["A"]) == -np.inf
+    assert _scorer(data, arm_labels, clamped_everywhere).local_score("B", ["A"]) == -np.inf
 
 
-def test_default_construction_is_unchanged_by_the_new_flag():
+def test_observational_path_unaffected_by_the_interventional_branch():
     """A scorer built with no interventional kwargs returns the pre-change value.
 
     The literals below were captured from the observational code path at commit
-    e58b54c (before `pooled_interventional` existed) on this exact fixed data.
-    They guard the requirement that nothing changes unless the new flag is
-    explicitly set to True.
+    e58b54c (before any of this interventional work) on this exact fixed data.
+    They guard the requirement that the flat path is untouched.
 
     Compared with a relative tolerance rather than `==` because the underlying GLM
     fit goes through whatever BLAS/LAPACK the platform provides, which reorders
@@ -231,26 +212,7 @@ def test_default_construction_is_unchanged_by_the_new_flag():
 
     assert scorer.local_score("B", ["A"]) == pytest.approx(-181.9218239637686, rel=1e-9)
     assert scorer.local_score("A", ["B"]) == pytest.approx(-154.11763570887948, rel=1e-9)
-    # Default flag value must be off, so local_score never reaches the pooled branch.
-    assert scorer.pooled_interventional is False
 
-
-def test_armwise_path_unchanged_when_flag_left_off():
-    """With `pooled_interventional` unset, the interventional branch still produces
-    the per-arm value captured at commit e58b54c on this fixed data.
-
-    See `test_default_construction_is_unchanged_by_the_new_flag` for why these are
-    compared with a relative tolerance instead of exact equality.
-    """
-    data, arm_labels, clamped_nodes = _two_node_scm()
-
-    scorer = pdr.BICGaussIndraPriors(
-        data,
-        edge_priors=EDGE_PRIORS,
-        interventional=True,
-        arm_labels=arm_labels,
-        clamped_nodes=clamped_nodes,
-    )
-
-    assert scorer.local_score("B", ["A"]) == pytest.approx(-42.70524914189197, rel=1e-9)
-    assert _orientation_margin(scorer) == pytest.approx(6.02689564594472, rel=1e-9)
+    # interventional=True without arm_labels must stay on the flat path.
+    flag_only = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS, interventional=True)
+    assert flag_only.local_score("B", ["A"]) == scorer.local_score("B", ["A"])

@@ -1,5 +1,5 @@
 """Integration coverage for estimate_posterior_dag's interventional (GIES-style)
-plumbing added alongside BICGaussIndraPriors._local_score_interventional.
+plumbing alongside BICGaussIndraPriors._local_score_interventional.
 
 estimate_posterior_dag itself isn't exercised by tests/test_network.py (its own
 docstring dismisses the INDRA/bootstrap-driven entry points as "requiring
@@ -15,23 +15,25 @@ process_bootstrap -> the scorer, for both selection modes ("best_of" and
 "consensus"), to catch plumbing bugs (e.g. arm_labels desynchronizing from a
 bootstrap resample) that a local_score-only test can't see.
 
-One deliberately-scoped-down expectation: the local_score-level test proves
-interventional scoring gives the TRUE full-graph hypothesis (A->B->C) a
-decisively higher TOTAL score than its Markov-equivalent reverse (C->B->A).
-That is a clean two-hypothesis comparison. A greedy hill-climb search doesn't
-evaluate hypotheses that way - it adds/removes one edge at a time, and
-`local_score("A", ["B"])` in isolation (not paired against the "A has no
-parent" alternative under the reverse hypothesis) prefers B as a parent
-regardless of orientation, because B still correlates with A in the
-observational arm even though that correlation reflects B depending on A, not
-the other way round. Empirically (checked across 10 runs, 5 seeds x both
-selection modes), this means the search reliably recovers B->C (never C->B -
-C's dependence on B is real in BOTH arms, so that edge has no ambiguity at the
-per-edge level either) but the A<->B edge's orientation is close to a coin
-flip through this specific search procedure, even though the data contains
-the information to prefer A->B in a full-graph comparison. These tests
-therefore only assert the robust part (B->C recovered, C->B never appears) -
-see the local_score-level test for the full orientation-identification claim.
+These tests assert recovery of the whole true chain (A->B and B->C present, and
+neither reverse edge), which the pooled interventional score achieves through the
+greedy search: measured across 13 runs (5 seeds x both selection modes, plus the
+small-clamped-arm/arm_resample_floor config at 3 seeds), every run returned
+exactly {A->B, B->C}.
+
+Worth recording why that is a stronger claim than it used to be. The interventional
+score originally summed a separate per-arm GLM fit, which gave each arm its own
+free intercept and so discarded the between-arm mean shifts that carry the
+orientation signal; under that scorer these tests could only assert the B->C half.
+B->C was never ambiguous per-edge (C's dependence on B is real in BOTH arms), but
+A<->B's orientation was close to a coin flip, because a greedy search evaluates
+`local_score("A", ["B"])` in isolation rather than pairing it against the "A has no
+parent" alternative under the reverse hypothesis, and B still correlates with A in
+the observational arm regardless of direction. Pooling to a single intercept made
+the per-edge scores themselves orientation-aware, so the search now settles on the
+true orientation without needing a full-graph comparison to break the tie. If a
+future scoring change makes these A->B assertions flaky, that is a real regression
+in orientation power, not a too-strict test.
 """
 
 import importlib
@@ -76,7 +78,7 @@ def _chain_data_with_intervention_arm(seed: int = 1, n_obs: int = 80, n_clamp: i
     return data, arm_labels, clamped_nodes, indra_priors
 
 
-def test_estimate_posterior_dag_interventional_best_of_recovers_b_to_c():
+def test_estimate_posterior_dag_interventional_best_of_recovers_the_chain():
     data, arm_labels, clamped_nodes, indra_priors = _chain_data_with_intervention_arm()
     allowed_edges = {("A", "B"), ("B", "A"), ("B", "C"), ("C", "B")}
 
@@ -97,13 +99,11 @@ def test_estimate_posterior_dag_interventional_best_of_recovers_b_to_c():
     edges = {(str(u), str(v)) for u, v in y0_graph.directed.edges()}
     assert edges, "expected a non-trivial learned network"
     assert edges <= allowed_edges, f"unexpected edge(s) outside the prior: {edges - allowed_edges}"
-    # The robust part of the claim - see module docstring for why A<->B's
-    # orientation isn't asserted here.
-    assert ("B", "C") in edges
-    assert ("C", "B") not in edges
+    # The whole true chain, both orientations - see module docstring.
+    assert edges == {("A", "B"), ("B", "C")}
 
 
-def test_estimate_posterior_dag_interventional_consensus_recovers_b_to_c():
+def test_estimate_posterior_dag_interventional_consensus_recovers_the_chain():
     data, arm_labels, clamped_nodes, indra_priors = _chain_data_with_intervention_arm(seed=2)
     allowed_edges = {("A", "B"), ("B", "A"), ("B", "C"), ("C", "B")}
 
@@ -124,17 +124,16 @@ def test_estimate_posterior_dag_interventional_consensus_recovers_b_to_c():
     edges = {(str(u), str(v)) for u, v in y0_graph.directed.edges()}
     assert edges, "expected a non-trivial learned network"
     assert edges <= allowed_edges, f"unexpected edge(s) outside the prior: {edges - allowed_edges}"
-    assert ("B", "C") in edges
-    assert ("C", "B") not in edges
+    assert edges == {("A", "B"), ("B", "C")}
 
 
-def test_estimate_posterior_dag_consensus_with_arm_resample_floor_recovers_b_to_c():
+def test_estimate_posterior_dag_consensus_with_arm_resample_floor_recovers_the_chain():
     """arm_resample_floor keeps a small clamped arm intact across bootstrap draws
     instead of letting consensus's frac=0.65 resampling collapse it to a handful
     of rows - added after that exact failure mode (rank-deficient GLM fits from an
     over-resampled small arm) showed up running the real HPN-DREAM pilot data.
     Shrinks the clamped arm down to a size where the floor actually matters, and
-    checks the plumbing doesn't break the same robust B->C recovery as the other
+    checks the plumbing doesn't break the same chain recovery as the other
     consensus test above.
     """
     data, arm_labels, clamped_nodes, indra_priors = _chain_data_with_intervention_arm(
@@ -160,8 +159,7 @@ def test_estimate_posterior_dag_consensus_with_arm_resample_floor_recovers_b_to_
     edges = {(str(u), str(v)) for u, v in y0_graph.directed.edges()}
     assert edges, "expected a non-trivial learned network"
     assert edges <= allowed_edges, f"unexpected edge(s) outside the prior: {edges - allowed_edges}"
-    assert ("B", "C") in edges
-    assert ("C", "B") not in edges
+    assert edges == {("A", "B"), ("B", "C")}
 
 
 def test_estimate_posterior_dag_consensus_subsample_frac_override():

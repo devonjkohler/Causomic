@@ -302,16 +302,24 @@ def test_bic_gauss_indra_priors_variable_clamped_in_every_arm_returns_neg_inf():
     assert scorer.local_score("A", ["B"]) == -np.inf
 
 
-def test_bic_gauss_indra_priors_mismatched_df_model_across_arms_returns_neg_inf():
-    """Regression test for a real failure hit running this against the HPN-DREAM
-    pilot's actual arms (6 rows before any resampling): a bootstrap resample of
-    a small arm can leave too few rows to estimate the full parent set, so
-    statsmodels' GLM fit there is rank-deficient and reports a SMALLER df_model
-    than a well-powered arm - previously a hard `assert` on this raised
-    AssertionError, which propagates through joblib and aborts an entire
-    Parallel(...) bootstrap run for every worker, not just the offending one.
-    Must return -inf (a degenerate-fit signal, like any other singular fit)
-    instead of raising.
+def test_bic_gauss_indra_priors_tiny_arm_does_not_make_candidate_unscorable():
+    """A rank-deficient small arm must not sink an otherwise-scorable candidate.
+
+    History: this scenario comes from the HPN-DREAM pilot's real arms (6 rows
+    before any resampling), where a bootstrap resample of a small arm can leave
+    too few rows to estimate the full parent set. When the interventional score
+    fit one GLM *per arm*, such an arm was rank-deficient and reported a smaller
+    df_model than a well-powered arm; the score required all arms to agree on
+    df_model and returned -inf when they didn't, so at HPN-DREAM/Perturb-seq arm
+    sizes most multi-parent candidates became unscorable. (Earlier still, a hard
+    `assert` on the mismatch raised AssertionError, which propagates through
+    joblib and aborts an entire Parallel(...) run for every worker.)
+
+    The pooled score has no per-arm fits, so the failure mode is structurally
+    impossible: the 2-row "tiny" arm simply contributes 2 rows to one pooled fit.
+    Assert the candidate now scores finitely, and - since nothing is clamped -
+    that it equals the flat observational score over all 22 rows exactly, i.e.
+    partitioning rows into arms by itself changes nothing.
     """
     rng = np.random.default_rng(0)
     n_big, n_tiny = 20, 2
@@ -328,10 +336,24 @@ def test_bic_gauss_indra_priors_mismatched_df_model_across_arms_returns_neg_inf(
     scorer = pdr.BICGaussIndraPriors(
         data, edge_priors=edge_priors, interventional=True, arm_labels=arm_labels, clamped_nodes={}
     )
-    # Must not raise - the 2-row "tiny" arm can't identify both P1 and P2's
-    # coefficients (2 predictors + intercept from 2 points), so its df_model
-    # differs from the well-powered "big" arm's.
-    assert scorer.local_score("Y", ["P1", "P2"]) == -np.inf
+    score = scorer.local_score("Y", ["P1", "P2"])
+    assert np.isfinite(score)
+
+    flat = pdr.BICGaussIndraPriors(data, edge_priors=edge_priors).local_score("Y", ["P1", "P2"])
+    assert score == flat
+
+    # Clamping Y in the tiny arm is what drops rows - and only those rows.
+    scorer_clamped = pdr.BICGaussIndraPriors(
+        data,
+        edge_priors=edge_priors,
+        interventional=True,
+        arm_labels=arm_labels,
+        clamped_nodes={"tiny": ["Y"]},
+    )
+    flat_big_only = pdr.BICGaussIndraPriors(data.iloc[:n_big], edge_priors=edge_priors).local_score(
+        "Y", ["P1", "P2"]
+    )
+    assert scorer_clamped.local_score("Y", ["P1", "P2"]) == flat_big_only
 
 
 def test_bic_gauss_indra_priors_interventional_identifies_chain_orientation():

@@ -627,25 +627,19 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
     Interventional (GIES-style) scoring
     ------------------------------------
     Passing `interventional=True` together with `arm_labels` (and, usually,
-    `clamped_nodes`) switches `local_score` to a second code path that sums
-    log-likelihood contributions across experimental arms instead of fitting one
-    flat GLM over all of `data` - see `local_score` / `_local_score_interventional`.
+    `clamped_nodes`) switches `local_score` to a second code path: a pooled
+    (Hauser-Buhlmann style) GIES score that fits one GLM - and therefore estimates
+    one intercept - over every row where the scored variable is not clamped,
+    dropping only the rows whose arm clamps that variable. See `local_score` /
+    `_local_score_interventional`.
+
     This is strictly opt-in: with the default `interventional=False`, or with
     `interventional=True` but no `arm_labels`, `local_score` runs the exact same
     single-GLM-over-self.data code path as before this feature existed. Existing
     callers (all of which construct this class without either argument) are
-    unaffected byte-for-byte.
-
-    Adding `pooled_interventional=True` on top of that selects a third path,
-    `_local_score_interventional_pooled`, which fits ONE pooled GLM over every
-    row where `variable` is not clamped instead of one GLM per arm. The arm-wise
-    path gives each arm its own free intercept, which absorbs that arm's mean
-    shift in `variable` - and those between-arm mean shifts are the interventional
-    signal that orients edges, so the arm-wise path is close to uninformative
-    about direction. The pooled path keeps a single intercept, so an unexplained
-    between-arm shift must be accounted for by `variable`'s parents or it lands in
-    the residual. Default False preserves the arm-wise path exactly, which
-    published HPN-DREAM results depend on.
+    unaffected byte-for-byte. Because the interventional score pools rather than
+    fitting per arm, it also reduces exactly to that observational path whenever
+    no node is clamped - the arm partitioning by itself never changes a score.
     """
 
     def __init__(
@@ -657,7 +651,6 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
         interventional: bool = False,
         arm_labels: Optional[pd.Series] = None,
         clamped_nodes: Optional[dict] = None,
-        pooled_interventional: bool = False,
         **kwargs,
     ):
         """
@@ -674,11 +667,12 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
             See `local_score`'s docstring for the (currently inert - the
             multiplication is commented out) intended effect.
         interventional : bool, default=False
-            If True *and* `arm_labels` is given, `local_score` sums per-arm
-            log-likelihoods (skipping arms where `variable` was clamped) instead
-            of fitting one GLM over all of `data`. Default False, and the
-            fallback when `arm_labels` is missing, reproduces prior behavior
-            exactly - see class docstring.
+            If True *and* `arm_labels` is given, `local_score` uses the pooled
+            GIES interventional score - one GLM over every row where `variable`
+            isn't clamped, dropping the rows whose arm clamps it - instead of
+            fitting one GLM over all of `data`. Default False, and the fallback
+            when `arm_labels` is missing, reproduces prior behavior exactly - see
+            class docstring.
         arm_labels : Optional[pd.Series], default=None
             Per-sample experimental-arm label, one entry per row of `data`.
             Must share `data`'s index. Required for the interventional branch to
@@ -688,19 +682,10 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
             Maps an arm label (as found in `arm_labels`) to the list of node
             names pharmacologically clamped in that arm. An arm absent from this
             dict (or the dict being None/empty) is treated as having no clamped
-            nodes. A clamped node is only excluded from *its own* local-score
-            arm-contribution in the arm(s) where it's clamped; it remains a valid
-            regressor for every other variable's score in that same arm - that's
-            the whole point of interventional data (see
-            `_local_score_interventional`).
-        pooled_interventional : bool, default=False
-            Only consulted when the interventional branch is active (i.e.
-            `interventional=True` *and* `arm_labels` is not None). If True,
-            `local_score` dispatches to `_local_score_interventional_pooled` (one
-            pooled GLM, one intercept, one BIC penalty over the retained rows)
-            instead of `_local_score_interventional` (one GLM per arm, hence one
-            free intercept per arm). Default False leaves the arm-wise path
-            byte-for-byte unchanged.
+            nodes. A clamped node's rows are only excluded from *its own* local
+            score, in the arm(s) where it's clamped; it remains a valid regressor
+            for every other variable's score in those same rows - that's the whole
+            point of interventional data (see `_local_score_interventional`).
         """
         super().__init__(data, **kwargs)
         self.edge_priors = edge_priors or {}
@@ -713,7 +698,6 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
             ), "arm_labels must share data's index (one label per row of data)."
         self.arm_labels = arm_labels
         self.clamped_nodes = clamped_nodes or {}
-        self.pooled_interventional = pooled_interventional
 
     def local_score(self, variable: str, parents: list) -> float:
         """
@@ -758,14 +742,11 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
         matrices, etc.) to exclude them from consideration.
 
         If `self.interventional` and `self.arm_labels` are both set, this
-        delegates to `_local_score_interventional_pooled` when
-        `self.pooled_interventional` is True and to `_local_score_interventional`
-        otherwise - see those methods. Otherwise (the default), everything below
-        is unchanged from before either branch existed.
+        delegates to `_local_score_interventional` instead - see that method.
+        Otherwise (the default), everything below is unchanged from before that
+        branch existed.
         """
         if self.interventional and self.arm_labels is not None:
-            if self.pooled_interventional:
-                return self._local_score_interventional_pooled(variable, parents)
             return self._local_score_interventional(variable, parents)
 
         try:
@@ -792,150 +773,49 @@ class BICGaussIndraPriors(LogLikelihoodGauss):
 
     def _local_score_interventional(self, variable: str, parents: list) -> float:
         """
-        GIES-style interventional local score: sum log-likelihood of
-        `variable | parents` across experimental arms, then apply the BIC
-        complexity penalty once over the pooled effective sample size.
-
-        For each arm in `self.arm_labels`, `variable`'s contribution is dropped
-        entirely if `variable` is listed in `self.clamped_nodes[arm]` - a clamped
-        node's value there is experimenter-set, not generated by its parents, so
-        that arm carries no information about *this* edge. Every other arm still
-        contributes, including arms where one of `parents` (not `variable`) is
-        clamped: clamping never removes a column from `self.data`, only changes
-        which arms' *rows* count toward `variable`'s own score, so a clamped
-        parent's (fixed) value remains a perfectly ordinary regressor for scoring
-        `variable` in that arm. This is asserted explicitly below rather than
-        left implicit.
-
-        `_log_likelihood` (inherited from pgmpy's LogLikelihoodGauss) always reads
-        `self.data`, with no data-argument override, so each arm's contribution is
-        computed by temporarily pointing `self.data` at that arm's row-subset,
-        calling `_log_likelihood`, and restoring `self.data` in a `finally` block -
-        reusing the exact same GLM-fitting code the observational branch uses,
-        rather than duplicating it.
-
-        Returns -inf if `variable` is clamped in every arm (nothing to score), if
-        any contributing arm's fit is singular (matches the observational
-        branch's all-or-nothing -inf handling), or if arms disagree on
-        `df_model` (a small, post-resampling arm can be rank-deficient for the
-        full parent set - treated as a degenerate fit, not raised on).
-        """
-        contributing_arms = [
-            arm
-            for arm in pd.unique(self.arm_labels)
-            if variable not in self.clamped_nodes.get(arm, [])
-        ]
-        if not contributing_arms:
-            return -np.inf
-
-        original_data = self.data
-        arm_lls = []
-        arm_df_models = []
-        arm_n_rows = []
-        try:
-            for arm in contributing_arms:
-                arm_data = original_data.loc[self.arm_labels == arm]
-
-                # Clamping a *parent* must never remove it as a regressor for
-                # `variable`'s score in an arm that still contributes - assert
-                # that explicitly rather than assuming the column survived.
-                missing_parent_cols = [p for p in parents if p not in arm_data.columns]
-                assert not missing_parent_cols, (
-                    f"Parent column(s) {missing_parent_cols} missing from arm "
-                    f"{arm!r}'s data - a clamped parent must remain usable as a "
-                    "regressor in every arm where it isn't the variable being scored."
-                )
-                if arm_data.empty:
-                    continue
-
-                self.data = arm_data
-                try:
-                    ll, df_model = self._log_likelihood(variable=variable, parents=parents)
-                except Exception:
-                    return -np.inf
-                finally:
-                    self.data = original_data
-
-                arm_lls.append(ll)
-                arm_df_models.append(df_model)
-                arm_n_rows.append(len(arm_data))
-        finally:
-            self.data = original_data
-
-        if len(set(arm_df_models)) != 1:
-            # A contributing arm can legitimately have too few (post-resampling)
-            # rows to estimate the full parameter set - e.g. a bootstrap
-            # resample of a 6-row arm can leave 1-2 rows, so statsmodels' GLM
-            # fit there is rank-deficient and reports a SMALLER df_model than an
-            # arm with enough rows for every parent. That's not a bug to raise
-            # on (unlike the missing-parent-column case above, which can never
-            # legitimately happen) - it's a degenerate fit, treated the same as
-            # any other singular fit: exclude this candidate.
-            return -np.inf
-        df_model = arm_df_models[0]
-        n_eff = sum(arm_n_rows)
-
-        # Complexity penalty applied ONCE over n_eff (pooled rows across
-        # contributing arms) - not per-arm, per the class's interventional-scoring
-        # contract.
-        bic_score = sum(arm_lls) - (((df_model + 2) / 2) * np.log(n_eff))
-
-        # Soft prior component - identical to the observational branch.
-        prior_bonus = 0
-        for parent in parents:
-            p = self.edge_priors[(parent, variable)]
-            p = np.clip(p, 1e-6, 1 - 1e-6)  # Avoid log(0)
-            log_odds = np.log(p / (1 - p))
-            prior_bonus += log_odds
-
-        return bic_score + prior_bonus
-
-    def _local_score_interventional_pooled(self, variable: str, parents: list) -> float:
-        """
-        Pooled (Hauser-Buhlmann style) interventional local score: fit ONE GLM of
-        `variable | parents` over every row whose arm does not clamp `variable`,
+        Pooled (Hauser-Buhlmann style) GIES interventional local score: fit ONE GLM
+        of `variable | parents` over every row whose arm does not clamp `variable`,
         then apply the BIC complexity penalty once over that retained row count.
 
-        This is the opt-in alternative to `_local_score_interventional`
-        (`pooled_interventional=True`), and differs from it in exactly one
-        structural way that matters: a single intercept is estimated across all
-        retained rows rather than one per arm.
+        The defining property is that a single intercept is estimated across all
+        retained rows, rather than one per experimental arm. `_log_likelihood`
+        regresses `variable ~ parents` *with a constant*, so fitting once per arm
+        would hand each arm its own free intercept, and that intercept absorbs the
+        arm's mean shift in `variable`. Those between-arm mean shifts are precisely
+        the interventional signal used to orient edges, so a per-arm fit discards
+        the orientation information and scores only within-arm covariance - which
+        is symmetric in the two nodes of an edge and therefore says nothing about
+        direction. Pooling to one intercept means an unexplained between-arm shift
+        in `variable` must be accounted for by `variable`'s parents or it lands in
+        the residual, which is what makes a wrong orientation score worse than the
+        right one.
 
-        Why that matters. `_log_likelihood` regresses `variable ~ parents` *with a
-        constant*, so fitting once per arm hands each arm its own free intercept,
-        which absorbs that arm's mean shift in `variable`. Those between-arm mean
-        shifts are precisely the interventional signal used to orient edges, so the
-        arm-wise path throws the orientation information away and scores only
-        within-arm covariance - which is symmetric in the two nodes of an edge and
-        therefore says nothing about direction. Pooling to one intercept means an
-        unexplained between-arm shift in `variable` must be accounted for by
-        `variable`'s parents or it lands in the residual, which is what makes a
-        wrong orientation score worse than the right one. Pooling also
-        fixes two secondary defects of the arm-wise path at scale (many arms of a
-        few rows each, e.g. Perturb-seq pseudobulk): the complexity penalty is
-        charged once over the true parameter count instead of undercounting by a
-        factor of K arms, and there is no cross-arm `df_model` agreement
-        requirement to trip over, since small rank-deficient arms no longer get
-        their own fits.
+        Pooling matters twice more for designs with many small arms (e.g.
+        Perturb-seq pseudobulk, ~10^3 arms of 2-5 rows): the complexity penalty is
+        charged once over the parameters the single fit actually consumes, instead
+        of undercounting by a factor of K arms and making an extra parent nearly
+        free; and there is no cross-arm `df_model` agreement to satisfy, so a small
+        rank-deficient arm can't discard an otherwise-scorable candidate.
 
-        Row selection matches the arm-wise path's contract. Rows from arms where
-        `variable` is clamped are dropped: a clamped node's value there is
-        experimenter-set, not generated by its parents, so those rows carry no
-        information about *this* node's local mechanism. Clamping a *parent* drops
-        no rows and removes no regressor - a clamped parent's fixed value is an
-        ordinary regressor for another node's score - which is asserted explicitly
-        below rather than left implicit.
+        With no clamped nodes this reduces exactly to the observational branch's
+        single flat GLM over all of `self.data` - the arm partitioning alone never
+        changes a score. Rows are dropped only where `variable` itself is clamped:
+        a clamped node's value there is experimenter-set, not generated by its
+        parents, so those rows carry no information about *this* node's local
+        mechanism. Clamping a *parent* drops no rows and removes no regressor - a
+        clamped parent's fixed value is an ordinary regressor for another node's
+        score - which is asserted explicitly below rather than left implicit.
 
         `_log_likelihood` (inherited from pgmpy's LogLikelihoodGauss) always reads
         `self.data`, with no data-argument override, so the pooled fit is computed
         by temporarily pointing `self.data` at the retained row-subset and
         restoring it in a `finally` block - reusing the same GLM-fitting code the
-        other two branches use rather than duplicating it.
+        observational branch uses rather than duplicating it.
 
         Returns -inf if too few rows are retained to identify the model
         (`n_used <= len(parents) + 2`, which also covers `variable` being clamped
-        in every arm) or if the pooled fit is singular - matching the other
-        branches' all-or-nothing -inf handling.
+        in every arm) or if the pooled fit is singular - matching the
+        observational branch's all-or-nothing -inf handling.
         """
         clamped_arms = [
             arm for arm in pd.unique(self.arm_labels) if variable in self.clamped_nodes.get(arm, [])
@@ -1092,7 +972,6 @@ def process_bootstrap(
     interventional: bool = False,
     arm_labels: Optional[pd.Series] = None,
     clamped_nodes: Optional[dict] = None,
-    pooled_interventional: bool = False,
     arm_resample_floor: int = 0,
 ) -> Optional[DAG]:
     """
@@ -1137,12 +1016,6 @@ def process_bootstrap(
         for `interventional` to take effect - default is None.
     clamped_nodes : Optional[dict], optional
         Passed through to `score_fn` unchanged when `interventional` is True.
-    pooled_interventional : bool, optional
-        Passed through to `score_fn` (alongside the other interventional kwargs,
-        and only when `interventional` is True) to select the pooled single-GLM
-        interventional score over the per-arm one - see
-        `BICGaussIndraPriors._local_score_interventional_pooled`. Default is
-        False, which reproduces the per-arm behavior exactly.
     arm_resample_floor : int, optional
         Only meaningful when `arm_labels` is not None. Arms with fewer than this many
         rows are kept in full (unresampled) on every bootstrap draw rather than being
@@ -1214,10 +1087,7 @@ def process_bootstrap(
     interventional_kwargs = {}
     if interventional:
         interventional_kwargs = dict(
-            interventional=True,
-            arm_labels=resampled_arm_labels,
-            clamped_nodes=clamped_nodes,
-            pooled_interventional=pooled_interventional,
+            interventional=True, arm_labels=resampled_arm_labels, clamped_nodes=clamped_nodes
         )
     custom_score = score_fn(
         resampled_data,
@@ -1529,7 +1399,6 @@ def run_bootstrap(
     interventional: bool = False,
     arm_labels: Optional[pd.Series] = None,
     clamped_nodes: Optional[dict] = None,
-    pooled_interventional: bool = False,
     arm_resample_floor: int = 0,
 ) -> list:
     """
@@ -1634,11 +1503,10 @@ def run_bootstrap(
     The choice depends on computational resources and required precision
     for downstream biological interpretation and hypothesis generation.
 
-    interventional, arm_labels, clamped_nodes, pooled_interventional,
-    arm_resample_floor are forwarded to `process_bootstrap` (and from there to
-    `score_fn`) unchanged - default is `interventional=False`, `arm_labels=None`,
-    `pooled_interventional=False`, `arm_resample_floor=0`, which never alters this
-    function's own behavior; only the values ultimately reaching
+    interventional, arm_labels, clamped_nodes, arm_resample_floor are forwarded to
+    `process_bootstrap` (and from there to `score_fn`) unchanged - default is
+    `interventional=False`, `arm_labels=None`, `arm_resample_floor=0`, which never
+    alters this function's own behavior; only the values ultimately reaching
     `process_bootstrap` change.
     """
     if verbose:
@@ -1677,7 +1545,6 @@ def run_bootstrap(
             interventional=interventional,
             arm_labels=arm_labels,
             clamped_nodes=clamped_nodes,
-            pooled_interventional=pooled_interventional,
             arm_resample_floor=arm_resample_floor,
         )
         for i in tqdm(range(n_bootstrap), desc="Hill Climb runs")

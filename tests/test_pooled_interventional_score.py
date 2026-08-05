@@ -1,5 +1,6 @@
-"""Coverage for BICGaussIndraPriors._local_score_interventional, the pooled
-(Hauser-Buhlmann style) GIES interventional local score.
+"""Coverage for the pooled (Hauser-Buhlmann style) GIES interventional local score,
+shared by BICGaussIndraPriors and BICGaussNoPriors via
+_PooledInterventionalScoreMixin.
 
 Its defining property is that it fits ONE GLM - and therefore estimates ONE
 intercept - over every row where the scored variable isn't clamped. Fitting per
@@ -15,6 +16,10 @@ arms, and check that the score recovers the direction, that the complexity penal
 depends only on the retained row count (not the arm count), that clamping applies
 to the scored variable only and never to a parent, and that with nothing clamped
 the score collapses exactly onto the flat observational score.
+
+The last section covers BICGaussNoPriors specifically: it must get the identical
+pooled BIC (same retained rows, same penalty) with the prior log-odds term simply
+absent, since both classes route through the same mixin method.
 """
 
 import importlib
@@ -31,6 +36,10 @@ logging.getLogger("pgmpy").setLevel(logging.ERROR)
 # 0.5 both ways: log(p/(1-p)) == 0, so the prior contributes exactly nothing and
 # orientation is decided purely by the likelihood/penalty terms.
 EDGE_PRIORS = {("A", "B"): 0.5, ("B", "A"): 0.5}
+
+# Deliberately lopsided, for the tests that need a NONZERO prior contribution in
+# order to show it is the only thing BICGaussNoPriors leaves out.
+SKEWED_EDGE_PRIORS = {("A", "B"): 0.9, ("B", "A"): 0.2}
 
 CLAMPED_NODES = {"do_A": ["A"], "do_B": ["B"]}
 
@@ -216,3 +225,114 @@ def test_observational_path_unaffected_by_the_interventional_branch():
     # interventional=True without arm_labels must stay on the flat path.
     flag_only = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS, interventional=True)
     assert flag_only.local_score("B", ["A"]) == scorer.local_score("B", ["A"])
+
+
+# ---------------------------------------------------------------------------
+# BICGaussNoPriors - same pooled interventional score, minus the prior term
+# ---------------------------------------------------------------------------
+def _no_priors_scorer(data, arm_labels, clamped_nodes):
+    return pdr.BICGaussNoPriors(
+        data, interventional=True, arm_labels=arm_labels, clamped_nodes=clamped_nodes
+    )
+
+
+def test_no_priors_interventional_differs_from_prior_aware_only_by_the_prior():
+    """BICGaussNoPriors must produce the identical pooled BIC, with the edge
+    log-odds term simply absent.
+
+    Uses lopsided priors so the bonus is nonzero and this is a real constraint: the
+    difference between the two scorers must equal sum(log(p/(1-p))) over the parents
+    exactly. That pins both halves of the contract at once - same retained rows and
+    same complexity penalty (otherwise the difference wouldn't be exactly the
+    bonus), and no prior contribution in the no-priors class.
+    """
+    data, arm_labels, clamped_nodes = _two_node_scm()
+
+    no_priors = _no_priors_scorer(data, arm_labels, clamped_nodes)
+    with_priors = pdr.BICGaussIndraPriors(
+        data,
+        edge_priors=SKEWED_EDGE_PRIORS,
+        interventional=True,
+        arm_labels=arm_labels,
+        clamped_nodes=clamped_nodes,
+    )
+
+    for variable, parents in (("B", ["A"]), ("A", ["B"]), ("B", []), ("A", [])):
+        bonus = sum(
+            np.log(SKEWED_EDGE_PRIORS[(p, variable)] / (1 - SKEWED_EDGE_PRIORS[(p, variable)]))
+            for p in parents
+        )
+        assert with_priors.local_score(variable, parents) - no_priors.local_score(
+            variable, parents
+        ) == pytest.approx(bonus, abs=1e-12)
+
+
+def test_no_priors_interventional_score_orients_edge_correctly():
+    """With no prior term at all, the pooled likelihood alone must orient A -> B."""
+    data, arm_labels, clamped_nodes = _two_node_scm()
+
+    margin = _orientation_margin(_no_priors_scorer(data, arm_labels, clamped_nodes))
+
+    # Matches the prior-aware scorer's ~+108 at p=0.5, where the prior contributes 0.
+    assert margin > 50.0, f"failed to orient A->B without priors (margin={margin})"
+
+
+def test_no_priors_penalty_uses_retained_row_count():
+    """The no-priors interventional score is exactly the pooled BIC over the
+    retained rows - no prior term, so nothing else is added."""
+    data, arm_labels, clamped_nodes = _two_node_scm()
+
+    retained = data.loc[(arm_labels != "do_B").values]
+    reference = pdr.BICGaussNoPriors(retained)
+    ll, df_model = reference._log_likelihood(variable="B", parents=["A"])
+    expected = ll - (((df_model + 2) / 2) * np.log(len(retained)))
+
+    assert _no_priors_scorer(data, arm_labels, clamped_nodes).local_score("B", ["A"]) == expected
+
+
+def test_no_priors_score_reduces_to_observational_when_nothing_is_clamped():
+    """Same pooling invariant as the prior-aware class: arm labels alone never
+    move a score."""
+    data, arm_labels, _ = _two_node_scm()
+
+    flat = pdr.BICGaussNoPriors(data).local_score("B", ["A"])
+
+    assert _no_priors_scorer(data, arm_labels, {}).local_score("B", ["A"]) == flat
+    assert _no_priors_scorer(data, arm_labels, None).local_score("B", ["A"]) == flat
+
+
+def test_no_priors_score_is_neg_inf_when_variable_clamped_in_every_arm():
+    data, arm_labels, _ = _two_node_scm()
+    clamped_everywhere = {arm: ["B"] for arm in pd.unique(arm_labels)}
+
+    assert (
+        _no_priors_scorer(data, arm_labels, clamped_everywhere).local_score("B", ["A"]) == -np.inf
+    )
+
+
+def test_no_priors_observational_path_unaffected():
+    """The default (no interventional kwargs) path still returns plain BIC, and
+    `interventional=True` without `arm_labels` stays on it."""
+    data, _, _ = _two_node_scm()
+    scorer = pdr.BICGaussNoPriors(data)
+
+    ll, df_model = scorer._log_likelihood(variable="B", parents=["A"])
+    expected = ll - (((df_model + 2) / 2) * np.log(len(data)))
+    assert scorer.local_score("B", ["A"]) == expected
+
+    # No prior bonus: identical to the prior-aware scorer at p=0.5, where the
+    # bonus is exactly log(1) == 0.
+    with_neutral_priors = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS)
+    assert scorer.local_score("B", ["A"]) == with_neutral_priors.local_score("B", ["A"])
+
+    flag_only = pdr.BICGaussNoPriors(data, interventional=True)
+    assert flag_only.local_score("B", ["A"]) == expected
+
+
+def test_no_priors_rejects_misaligned_arm_labels():
+    """The shared `_init_interventional` validation applies here too."""
+    data, _, _ = _two_node_scm()
+    bad_labels = pd.Series(["obs"] * len(data), index=range(1000, 1000 + len(data)))
+
+    with pytest.raises(AssertionError, match="arm_labels must share data's index"):
+        pdr.BICGaussNoPriors(data, interventional=True, arm_labels=bad_labels)

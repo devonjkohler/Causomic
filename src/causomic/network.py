@@ -529,7 +529,7 @@ def estimate_posterior_dag(
         behavior exactly - `scoring_function` is never even passed these kwargs
         in that case. Only meaningful with a `scoring_function` that supports
         `interventional`/`arm_labels`/`clamped_nodes` (currently
-        `BICGaussIndraPriors`).
+        `BICGaussIndraPriors` and `BICGaussNoPriors`).
 
     arm_labels : Optional[pd.Series], optional
         Per-sample experimental-arm label, one entry per row of `data`, sharing

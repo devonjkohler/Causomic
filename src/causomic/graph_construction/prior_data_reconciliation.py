@@ -893,8 +893,12 @@ class BICGaussIndraPriors(_PooledInterventionalScoreMixin, LogLikelihoodGauss):
     def _local_score_interventional(self, variable: str, parents: list) -> float:
         """
         The shared pooled interventional BIC (see
-        `_PooledInterventionalScoreMixin._local_score_interventional` for what it
-        computes and why it pools), plus this class's soft prior component.
+        `_PooledInterventionalScoreMixin._pooled_interventional_bic` for what it
+        computes and why it pools), plus this class's soft prior component. The
+        shared method deliberately returns no prior term so `BICGaussNoPriors` can
+        reuse it; the edge log-odds are added here, so every score this class
+        returns includes them on the interventional branch exactly as on the
+        observational one.
 
         The prior term is the same sum of edge log-odds the observational branch
         adds, so switching a scorer between the two branches changes only the

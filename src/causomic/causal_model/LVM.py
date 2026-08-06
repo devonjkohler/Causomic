@@ -99,6 +99,11 @@ class LVM:
     """
     Latent Variable Structural Causal Model for Proteomics Data.
 
+    .. note::
+        Pyro's parameter store is global to the process. Each Pyro fit therefore
+        gets its own parameter namespace (see ``train_pyro``) so that fitting
+        several models in one session cannot leak parameters between them.
+
     This class implements a Bayesian latent variable model for causal inference
     in proteomics data. It supports both Pyro and NumPyro backends for
     probabilistic programming and provides methods for model fitting, missing
@@ -234,6 +239,9 @@ class LVM:
     >>> lvm.fit(data, graph)
     """
 
+    # Counter used to give every Pyro fit a unique parameter-store namespace.
+    _fit_counter: int = 0
+
     def __init__(
         self,
         backend: Literal["pyro", "numpyro"] = "pyro",
@@ -294,6 +302,7 @@ class LVM:
         self.summary_stats: Optional[Dict] = None
         self.original_params: Optional[Dict] = None
         self.guide_medians: Optional[Dict[str, torch.Tensor]] = None
+        self.guide_param_prefix: Optional[str] = None
         self.coefficients: Optional[pd.DataFrame] = None
         self.imputed_data: Optional[pd.DataFrame] = None
         self.posterior_samples: Optional[Union[np.ndarray, torch.Tensor]] = None
@@ -910,6 +919,27 @@ class LVM:
             guide = build_guide(poutine.block(model, hide=edge_sites))
         else:
             guide = build_guide(model)
+
+        # Give this fit its own parameter-store namespace.
+        #
+        # Pyro's parameter store is global to the process and autoguides derive
+        # their parameter names from the guide's class name, so two fits in one
+        # session collide. For AutoContinuous guides ("lowrank") the collision is
+        # fatal: they pack every latent into a single flat `loc`/`scale`/
+        # `cov_factor` sized by the model's total latent dimension, so a second
+        # fit silently receives the first fit's tensors and dies unpacking them
+        # ("shape '[n_obs]' is invalid for input of size ...") whenever the two
+        # models have different latent dimensions -- and, worse, would silently
+        # read the wrong site's values if the dimensions happened to match.
+        # AutoNormal/AutoDelta name parameters per site so they never raise, but
+        # they warm-start the second fit from the first fit's optimum, which
+        # makes results depend on fit order. Namespacing avoids all of that
+        # without touching global state, so previously fitted LVM objects stay
+        # valid and can still be queried (`clear_param_store()` would break
+        # them). Must be set before the guide's first call, i.e. before SVI runs.
+        LVM._fit_counter += 1  # on LVM itself, so subclasses cannot reuse a prefix
+        self.guide_param_prefix = f"{type(guide).__name__}_fit{LVM._fit_counter}"
+        guide._pyro_name = self.guide_param_prefix
 
         # Set up SVI inference
         # With stochastic edges inside the plate, we can use standard Trace_ELBO

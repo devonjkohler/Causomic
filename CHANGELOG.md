@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `LVM.fit` no longer leaks variational parameters between fits through Pyro's
+  process-global parameter store. Each Pyro fit now gets its own parameter
+  namespace (exposed as `LVM.guide_param_prefix`). Previously a second fit in the
+  same session reused the first fit's parameters: with `guide="lowrank"` (any
+  `AutoContinuous` guide, which packs all latents into one flat parameter named
+  after the guide class) it raised `shape '[n_obs]' is invalid for input of
+  size ...` whenever the two models had different latent dimensions, and with
+  `guide="normal"` or `guide="delta"` it silently warm-started from the previous
+  fit, making results depend on fit order. Callers no longer need to call
+  `pyro.clear_param_store()` between fits, and earlier fitted `LVM` objects stay
+  valid and queryable after a new fit.
+
 ## [0.9.0] - 2026-07-10
 
 First publicly packaged release, focused on publication readiness.

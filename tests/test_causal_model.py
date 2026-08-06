@@ -149,6 +149,68 @@ def test_intervention_produces_samples(fitted_lvm, sim_problem):
 
 
 # --------------------------------------------------------------------------- #
+# Parameter-store isolation between fits
+# --------------------------------------------------------------------------- #
+def _subgraph_without(graph, node):
+    """A strict subgraph of ``graph`` with every edge touching ``node`` removed."""
+    kept = [(str(u), str(v)) for u, v in graph.directed.edges() if node not in (str(u), str(v))]
+    nodes = sorted({name for edge in kept for name in edge})
+    return NxMixedGraph.from_edges(directed=kept), nodes
+
+
+def test_sequential_fits_do_not_share_parameters(sim_problem):
+    """Two Pyro fits in one process must not collide in the global param store.
+
+    AutoContinuous guides (``guide="lowrank"``) pack every latent into a single
+    flat parameter named after the guide class. Without a per-fit namespace the
+    second fit silently received the first fit's tensors and died unpacking them
+    whenever the two models had different latent dimensions.
+    """
+    pyro.clear_param_store()
+    data = sim_problem["data"]
+    graph = sim_problem["graph"]
+    small_graph, small_nodes = _subgraph_without(graph, str(sim_problem["roles"]["start"][-1]))
+    assert len(small_nodes) < len(data.columns)  # so the latent dimensions differ
+
+    first = LVM(backend="pyro", num_steps=5, verbose=False, guide="lowrank")
+    first.fit(data, graph)
+
+    second = LVM(backend="pyro", num_steps=5, verbose=False, guide="lowrank")
+    second.fit(data[small_nodes], small_graph)
+
+    assert first.guide_param_prefix != second.guide_param_prefix
+
+    # The earlier fit is still usable: namespacing leaves its parameters in place.
+    target = str(sim_problem["roles"]["start"][0])
+    first.intervention(
+        {target: -1.0},
+        outcome_node=[str(sim_problem["roles"]["end"][0])],
+        compare_value=0.0,
+        predictive_samples=10,
+    )
+    assert np.isfinite(np.asarray(first.intervention_samples)).all()
+
+
+def test_repeated_fits_are_independent(sim_problem):
+    """Identical data and seed must give identical parameters, whatever ran before.
+
+    Site-keyed guides (``normal``, ``delta``) never raised on a param-store
+    collision -- the second fit just resumed from the first fit's optimum, which
+    made results depend on fit order.
+    """
+    pyro.clear_param_store()
+    kwargs = dict(backend="pyro", num_steps=8, seed=7, verbose=False, guide="normal")
+
+    first = LVM(**kwargs)
+    first.fit(sim_problem["data"], sim_problem["graph"])
+
+    second = LVM(**kwargs)
+    second.fit(sim_problem["data"], sim_problem["graph"])
+
+    pd.testing.assert_frame_equal(first.coefficients, second.coefficients)
+
+
+# --------------------------------------------------------------------------- #
 # Stochastic-edge model variant
 # --------------------------------------------------------------------------- #
 def test_stochastic_edges_fit(sim_problem):

@@ -86,10 +86,10 @@ pip install -e .
 ### Optional dependencies
 - `dev` — testing and linting tools (`pytest`, `black`, `isort`):
   `pip install -e ".[dev]"`
-- **INDRA-CoGEx** — required only for the Neo4j-backed CoGEx query features
-  (`causomic.network`, `causomic.graph_construction.utils_neo4j`, and
-  `neo4j_indra_queries`). It is not on PyPI; install it from source if you need
-  those features:
+- **INDRA-CoGEx** — required only for the Neo4j backend of prior extraction
+  (`extract_indra_prior(..., backend="neo4j")` and the
+  `causomic.graph_construction.prior_extraction.neo4j_*` modules). It is not on
+  PyPI; install it from source if you need those features:
   ```bash
   pip install git+https://github.com/gyorilab/indra_cogex.git
   ```
@@ -113,41 +113,56 @@ from graph construction through interventional inference. Start there.
 
 ### Getting a prior network from INDRA
 
-Step 1 above needs an INDRA-derived graph to filter and query. There are two ways
-to get one:
+Step 1 above needs an INDRA-derived edge set. `extract_indra_prior` produces one
+from either of two backends, returning the same
+`source`/`target`/`evidence_count`/`source_count` table each way, so the rest of
+the pipeline is unaffected by which you pick.
 
-- **Local INDRA snapshot (recommended, offline).** Load a pre-cached INDRA
-  network — e.g. a `networkx.DiGraph` pickled from an INDRA CoGEx export — and
-  filter it with `prepare_graph`:
+- **Local INDRA snapshot (default, offline).** Load a pre-cached INDRA network —
+  e.g. a `networkx.DiGraph` pickled from an INDRA CoGEx export — and pass it as
+  `graph`:
 
   ```python
   import pickle
-  from causomic.graph_construction import prepare_graph, query_forward_paths
+  from causomic.network import extract_indra_prior
 
   with open("indranet_dir_graph_fix_corr_weights.pkl", "rb") as f:
       indra_graph = pickle.load(f)
 
-  filtered_graph = prepare_graph(
-      indra_graph,
-      measured_nodes=None,          # or your list of measured gene symbols
-      node_types=["HGNC"],
-      stmt_types=["IncreaseAmount", "DecreaseAmount"],
-  )
-
-  prior_edges = query_forward_paths(
-      filtered_graph, start_nodes=["EGFR"], end_nodes=["ERK"], n_mediators=2,
+  prior_edges = extract_indra_prior(
+      source=["EGFR"],
+      target=["ERK"],
+      measured_proteins=data.columns.tolist(),
+      graph=indra_graph,
+      n_mediators=2,
   )
   ```
 
-  This is the pattern used throughout the lab's own projects and requires no
-  live database connection — only a local copy of the INDRA graph pickle.
+  This requires no live database connection — only a local copy of the INDRA
+  graph pickle — and is the pattern used throughout the lab's own projects.
 
-- **Live Neo4j query (alternative).** `extract_indra_prior` queries a running
-  INDRA CoGEx Neo4j instance directly and is useful if you need up-to-date
-  statements rather than a static snapshot. It requires the optional
-  [INDRA-CoGEx install](#optional-dependencies) and a reachable Neo4j database
-  with credentials (`Neo4jClient(url=..., auth=(...))`) — see its docstring
-  for the full query example.
+  For finer control, the underlying steps are available separately:
+  `prepare_graph` filters the raw graph, and `query_forward_paths`,
+  `query_neighborhood_paths`, `query_drug_targets`, and `query_effect_nodes`
+  run the path searches. Import them from
+  `causomic.graph_construction.prior_extraction`.
+
+- **Live Neo4j query.** Pass `backend="neo4j"` with an authenticated client to
+  query a running INDRA CoGEx instance directly, which is useful when you need
+  up-to-date statements rather than a static snapshot. It requires the optional
+  [INDRA-CoGEx install](#optional-dependencies) and a reachable Neo4j database:
+
+  ```python
+  from indra_cogex.client import Neo4jClient
+
+  prior_edges = extract_indra_prior(
+      source=["EGFR"],
+      target=["ERK"],
+      measured_proteins=data.columns.tolist(),
+      backend="neo4j",
+      client=Neo4jClient(url=api_url, auth=("neo4j", password)),
+  )
+  ```
 
 ## Data Requirements
 
@@ -167,16 +182,34 @@ can be passed directly into Causomic. A Python-side `dataProcess` is available i
 ## Main Components
 
 ### 🕸️ **Graph Construction** (`causomic.graph_construction`)
-Build, filter, and query biological interaction graphs, and reconcile a prior
-network with experimental data.
+Three subpackages, one per stage of building a causal graph.
+
+**`prior_extraction`** — pull a candidate edge set out of INDRA, from a local
+`networkx` graph (default) or a live Neo4j-CoGEx instance.
 - `prepare_graph`, `add_evidence_info`, `filter_graph_by_evidence_count`
-- `query_drug_targets`, `query_effect_nodes`, `query_forward_paths`, `query_confounders`
-- `prepare_indra_priors`, `run_bootstrap`, `calculate_edge_probabilities`
+- `query_forward_paths`, `query_neighborhood_paths`, `query_drug_targets`,
+  `query_effect_nodes`, `query_confounders`
+- `resolve_curies`, `format_query_results`, `pull_downstream_network`
 
   `query_forward_paths` is the built-in control for maximum path length /
   mediator count between a source and target node — its `n_mediators`
   argument caps how many intermediate nodes a path may have, so you don't
   need to reimplement path-length pruning yourself.
+
+**`posterior_estimation`** — learn which candidate edges the data supports.
+- `SparseHillClimb` — hill-climb search restricted to prior edges
+- `BICGaussIndraPriors`, `BICGaussNoPriors`, `AICGaussIndraPriors`,
+  `AICGaussNoPriors` — scoring functions, with and without the prior term
+- `run_bootstrap`, `consensus_dag`, `best_scoring_dag` — resample, then reduce
+  many candidate DAGs to one
+- `run_dagma` — continuous-optimization alternative to the hill climb
+- `prepare_indra_priors`, `calculate_edge_probabilities` — evidence counts to
+  edge probabilities
+- `filter_to_causal_subgraph`, `search_path_diagnostic`
+
+**`ci_repair`** — test the learned graph and repair what fails.
+- `find_failed_tests`, `convert_to_y0_graph`
+- `lookup_confounder_candidates`, `process_failed_test`
 
 ### 🎯 **Causal Modeling** (`causomic.causal_model`)
 Probabilistic structural causal models for intervention prediction.
@@ -201,10 +234,10 @@ Synthetic graph and data generation for testing and method development.
 - `causomic.workflows` — packaged pipelines (`run_causal_workflow`,
   `run_toxicity_detection_workflow`)
 
-  `extract_indra_prior` queries INDRA-CoGEx live and requires the optional
-  [INDRA-CoGEx install](#optional-dependencies); most projects instead load a
-  local INDRA graph pickle and call `prepare_graph` directly (see
-  [Getting a prior network from INDRA](#getting-a-prior-network-from-indra)).
+  `extract_indra_prior` defaults to `backend="nx"`, which reads a local INDRA
+  graph pickle and needs no credentials. `backend="neo4j"` queries INDRA-CoGEx
+  live and requires the optional [INDRA-CoGEx install](#optional-dependencies)
+  (see [Getting a prior network from INDRA](#getting-a-prior-network-from-indra)).
 
 ## Documentation
 
@@ -218,8 +251,9 @@ Detailed API documentation lives in the source-code docstrings. Key modules:
 
 - `causomic.causal_model.LVM` — latent-variable causal model
 - `causomic.causal_model.models` — underlying Pyro model definitions
-- `causomic.graph_construction.utils_nx` — network construction and querying
-- `causomic.graph_construction.prior_data_reconciliation` — prior/data reconciliation
+- `causomic.graph_construction.prior_extraction` — INDRA prior networks (nx and Neo4j backends)
+- `causomic.graph_construction.posterior_estimation` — structure learning and scoring
+- `causomic.graph_construction.ci_repair` — independence testing and confounder repair
 - `causomic.data_analysis.proteomics_data_processor` — data preprocessing
 - `causomic.simulation` — synthetic graph and data generation
 

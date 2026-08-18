@@ -9,7 +9,7 @@ heavier (bootstrap + hill climb), which these tests keep small/fast (n_bootstrap
 in the tens, not the hundreds) rather than skipping.
 
 Uses the same synthetic A->B->C chain (with an interventional arm clamping B)
-as tests/test_prior_data_reconciliation.py's local_score-level chain-orientation
+as tests/test_posterior_estimation.py's local_score-level chain-orientation
 test, but end-to-end through estimate_posterior_dag -> run_bootstrap ->
 process_bootstrap -> the scorer, for both selection modes ("best_of" and
 "consensus"), to catch plumbing bugs (e.g. arm_labels desynchronizing from a
@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 
 net = importlib.import_module("causomic.network")
-pdr = importlib.import_module("causomic.graph_construction.prior_data_reconciliation")
+pe = importlib.import_module("causomic.graph_construction.posterior_estimation")
 
 
 def _chain_data_with_intervention_arm(seed: int = 1, n_obs: int = 80, n_clamp: int = 80):
@@ -86,8 +86,8 @@ def test_estimate_posterior_dag_interventional_best_of_recovers_the_chain():
         data.copy(),
         indra_priors,
         prior_strength=5.0,
-        scoring_function=pdr.BICGaussIndraPriors,
-        search_algorithm=pdr.SparseHillClimb,
+        scoring_function=pe.BICGaussIndraPriors,
+        search_algorithm=pe.SparseHillClimb,
         n_bootstrap=30,
         edge_probability=0.5,
         selection="best_of",
@@ -111,8 +111,8 @@ def test_estimate_posterior_dag_interventional_consensus_recovers_the_chain():
         data.copy(),
         indra_priors,
         prior_strength=5.0,
-        scoring_function=pdr.BICGaussIndraPriors,
-        search_algorithm=pdr.SparseHillClimb,
+        scoring_function=pe.BICGaussIndraPriors,
+        search_algorithm=pe.SparseHillClimb,
         n_bootstrap=30,
         edge_probability=0.5,
         selection="consensus",
@@ -145,8 +145,8 @@ def test_estimate_posterior_dag_consensus_with_arm_resample_floor_recovers_the_c
         data.copy(),
         indra_priors,
         prior_strength=5.0,
-        scoring_function=pdr.BICGaussIndraPriors,
-        search_algorithm=pdr.SparseHillClimb,
+        scoring_function=pe.BICGaussIndraPriors,
+        search_algorithm=pe.SparseHillClimb,
         n_bootstrap=30,
         edge_probability=0.5,
         selection="consensus",
@@ -179,8 +179,8 @@ def test_estimate_posterior_dag_consensus_subsample_frac_override():
             data.copy(),
             indra_priors,
             prior_strength=5.0,
-            scoring_function=pdr.BICGaussIndraPriors,
-            search_algorithm=pdr.SparseHillClimb,
+            scoring_function=pe.BICGaussIndraPriors,
+            search_algorithm=pe.SparseHillClimb,
             n_bootstrap=5,
             edge_probability=0.5,
             selection="consensus",
@@ -194,8 +194,8 @@ def test_estimate_posterior_dag_consensus_subsample_frac_override():
             data.copy(),
             indra_priors,
             prior_strength=5.0,
-            scoring_function=pdr.BICGaussIndraPriors,
-            search_algorithm=pdr.SparseHillClimb,
+            scoring_function=pe.BICGaussIndraPriors,
+            search_algorithm=pe.SparseHillClimb,
             n_bootstrap=5,
             edge_probability=0.5,
             selection="consensus",
@@ -214,8 +214,8 @@ def test_estimate_posterior_dag_default_ignores_interventional_kwargs_path():
         data.copy(),
         indra_priors,
         prior_strength=5.0,
-        scoring_function=pdr.BICGaussIndraPriors,
-        search_algorithm=pdr.SparseHillClimb,
+        scoring_function=pe.BICGaussIndraPriors,
+        search_algorithm=pe.SparseHillClimb,
         n_bootstrap=10,
         edge_probability=0.5,
         selection="best_of",

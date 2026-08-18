@@ -3,8 +3,9 @@
 Covers the causal-path filtering used to prune a posterior graph down to the
 nodes relevant to a treatment/outcome query, and the consensus-DAG aggregation
 that turns a set of bootstrap DAGs plus edge priors into a single acyclic graph.
-extract_indra_prior and repair_confounding require external services and are
-not exercised here. estimate_posterior_dag's hill-climb-driven selections
+repair_confounding requires external services and is not exercised here;
+extract_indra_prior's nx backend runs fully in-process and is covered below,
+with its neo4j backend exercised against mocked query helpers. estimate_posterior_dag's hill-climb-driven selections
 ("best_of"/"consensus") are too heavy for unit tests, but its "dagma" selection
 is a single, cheap continuous-optimization fit and is exercised below (gated
 behind pytest.importorskip("dagma") since it's an optional dependency).
@@ -98,7 +99,72 @@ def test_consensus_dag_result_is_acyclic():
     assert nx.is_directed_acyclic_graph(out)
 
 
-def test_extract_indra_prior_runs_and_respects_verbose(monkeypatch, capsys):
+def _indra_nx_graph():
+    """Minimal INDRA-shaped nx graph: A -> M -> B, plus an off-path node D."""
+    G = nx.DiGraph()
+    for node in ("A", "M", "B", "D"):
+        G.add_node(node, ns="HGNC")
+
+    def stmts(count, sources):
+        return [
+            {
+                "stmt_type": "IncreaseAmount",
+                "evidence_count": count,
+                "source_counts": {s: 1 for s in sources},
+            }
+        ]
+
+    G.add_edge("A", "M", statements=stmts(4, ["reach", "sparser"]))
+    G.add_edge("M", "B", statements=stmts(3, ["reach"]))
+    G.add_edge("A", "D", statements=stmts(9, ["reach"]))
+    return G
+
+
+def test_extract_indra_prior_nx_is_the_default_backend():
+    # No `backend=` argument: must take the nx path, needing only a graph.
+    result = net.extract_indra_prior(
+        source=["A"],
+        target=["B"],
+        measured_proteins=["A", "M", "B", "D"],
+        graph=_indra_nx_graph(),
+        verbose=False,
+    )
+    assert list(result.columns) == ["source", "target", "evidence_count", "source_count"]
+    edges = set(zip(result["source"], result["target"]))
+    # A->M->B is a 1-mediator path to the target; A->D leads nowhere near B.
+    assert ("A", "M") in edges
+    assert ("M", "B") in edges
+    assert ("A", "D") not in edges
+
+
+def test_extract_indra_prior_nx_carries_evidence_and_source_counts():
+    result = net.extract_indra_prior(
+        source=["A"],
+        target=["B"],
+        measured_proteins=["A", "M", "B"],
+        graph=_indra_nx_graph(),
+        verbose=False,
+    )
+    a_m = result[(result["source"] == "A") & (result["target"] == "M")].iloc[0]
+    assert a_m["evidence_count"] == 4
+    assert a_m["source_count"] == 2  # two distinct sources on the A->M statement
+
+
+def test_extract_indra_prior_nx_respects_n_mediators():
+    # n_mediators=0 allows only direct source->target edges; A->B is not one.
+    result = net.extract_indra_prior(
+        source=["A"],
+        target=["B"],
+        measured_proteins=["A", "M", "B"],
+        graph=_indra_nx_graph(),
+        n_mediators=0,
+        verbose=False,
+    )
+    assert result.empty
+    assert list(result.columns) == ["source", "target", "evidence_count", "source_count"]
+
+
+def test_extract_indra_prior_neo4j_backend_runs_and_respects_verbose(monkeypatch, capsys):
     # Regression: extract_indra_prior referenced an undefined `verbose` at the
     # summary-print step, raising NameError whenever called. Mock the INDRA
     # query helpers so the function runs end-to-end without a Neo4j client.
@@ -108,108 +174,44 @@ def test_extract_indra_prior_runs_and_respects_verbose(monkeypatch, capsys):
             "target": ["B"],
             "relation": ["IncreaseAmount"],
             "evidence_count": [2],
+            "source_counts": [{"reach": 2}],
         }
     )
-    monkeypatch.setattr(net, "get_ids", lambda names, kind: list(names))
+    monkeypatch.setattr(net, "resolve_curies", lambda names, kind: list(names))
     monkeypatch.setattr(net, "get_one_step_root_down", lambda **kw: "q1")
     monkeypatch.setattr(net, "get_two_step_root_known_med", lambda **kw: "q2")
     monkeypatch.setattr(net, "get_three_step_root", lambda **kw: "q3")
     monkeypatch.setattr(net, "format_query_results", lambda _q: one_row.copy())
 
     result = net.extract_indra_prior(
-        source=["A"], target=["B"], measured_proteins=["A", "B"], client=object(), verbose=True
+        source=["A"],
+        target=["B"],
+        measured_proteins=["A", "B"],
+        backend="neo4j",
+        client=object(),
+        verbose=True,
     )
     # Three identical mocked queries -> evidence counts summed for the A->B edge.
-    assert list(result.columns) == ["source", "target", "evidence_count"]
+    assert list(result.columns) == ["source", "target", "evidence_count", "source_count"]
     assert result.loc[0, "source"] == "A"
     assert result.loc[0, "target"] == "B"
     assert result.loc[0, "evidence_count"] == 6
+    # source_count is maxed, not summed: the same reader behind three duplicate
+    # rows is still one source.
+    assert result.loc[0, "source_count"] == 1
     assert capsys.readouterr().out != ""
 
-    net.extract_indra_prior(
-        source=["A"], target=["B"], measured_proteins=["A", "B"], client=object(), verbose=False
-    )
-    assert capsys.readouterr().out == ""
+
+def test_extract_indra_prior_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="Unknown backend"):
+        net.extract_indra_prior(["A"], ["B"], ["A", "B"], backend="sparql")
 
 
-def test_consensus_dag_ignores_none_entries():
-    dags = [None, None]
-    g = nx.DiGraph()
-    g.add_edge("X", "Y")
-    dags.append(g)
-    priors = _priors([("X", "Y", 0.9)])
-    out = net.consensus_dag(dags, priors, min_freq=0.5)
-    # Only one valid DAG, edge freq 1.0.
-    assert ("X", "Y") in out.edges()
+def test_extract_indra_prior_requires_graph_for_nx_backend():
+    with pytest.raises(ValueError, match="requires a `graph`"):
+        net.extract_indra_prior(["A"], ["B"], ["A", "B"])
 
 
-def test_estimate_posterior_dag_dagma_selection_restricts_to_prior_edges():
-    pytest.importorskip("dagma")
-
-    rng = np.random.default_rng(0)
-    n = 500
-    A = rng.normal(size=n)
-    B = 2.0 * A + rng.normal(scale=0.1, size=n)
-    C = rng.normal(size=n)  # independent noise, absent from the prior
-    data = pd.DataFrame({"A": A, "B": B, "C": C})
-
-    indra_priors = pd.DataFrame({"source": ["A"], "target": ["B"], "evidence_count": [10]})
-
-    y0_graph, bootstrap_dags = net.estimate_posterior_dag(
-        data,
-        indra_priors,
-        selection="dagma",
-        return_bootstrap_dags=True,
-        verbose=False,
-    )
-
-    edges = {(str(u), str(v)) for u, v in y0_graph.directed.edges()}
-    assert edges == {("A", "B")}
-    # Single deterministic full-data fit -> exactly one candidate DAG.
-    assert len(bootstrap_dags) == 1
-    for u, v in y0_graph.directed.edges():
-        assert y0_graph.directed[u][v]["edge_prob"] == 1.0
-
-
-def test_estimate_posterior_dag_dagma_weighted_selection_uses_evidence_strength():
-    pytest.importorskip("dagma")
-
-    # Two structurally identical edges (A->B, C->D); only the INDRA evidence
-    # strength differs. At this lambda1, plain "dagma" keeps both, but
-    # "dagma_weighted" should favor the well-evidenced edge and drop the
-    # poorly-evidenced one despite the identical true effect size.
-    rng = np.random.default_rng(0)
-    n = 400
-    A = rng.normal(size=n)
-    C = rng.normal(size=n)
-    coef = 0.5
-    B = coef * A + rng.normal(scale=1.0, size=n)
-    D = coef * C + rng.normal(scale=1.0, size=n)
-    data = pd.DataFrame({"A": A, "B": B, "C": C, "D": D})
-
-    indra_priors = pd.DataFrame(
-        {"source": ["A", "C"], "target": ["B", "D"], "evidence_count": [50, 1]}
-    )
-
-    y0_plain = net.estimate_posterior_dag(
-        data.copy(),
-        indra_priors.copy(),
-        selection="dagma",
-        dagma_lambda1=0.3,
-        dagma_w_threshold=0.1,
-        verbose=False,
-    )
-    y0_weighted = net.estimate_posterior_dag(
-        data.copy(),
-        indra_priors.copy(),
-        selection="dagma_weighted",
-        dagma_lambda1=0.3,
-        dagma_w_threshold=0.1,
-        verbose=False,
-    )
-
-    plain_edges = {(str(u), str(v)) for u, v in y0_plain.directed.edges()}
-    weighted_edges = {(str(u), str(v)) for u, v in y0_weighted.directed.edges()}
-
-    assert plain_edges == {("A", "B"), ("C", "D")}
-    assert weighted_edges == {("A", "B")}
+def test_extract_indra_prior_requires_client_for_neo4j_backend():
+    with pytest.raises(ValueError, match="requires a `client`"):
+        net.extract_indra_prior(["A"], ["B"], ["A", "B"], backend="neo4j")

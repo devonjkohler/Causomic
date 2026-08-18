@@ -1,40 +1,27 @@
-"""Diagnostics for bootstrap structure-learning stability.
+"""Diagnostics for how much of a learned structure is real signal.
 
-Compares the sets of DAGs recovered from random initializations versus bootstrap
-resampling to assess how sensitive learned structure is to each source of
-variation.
+Bootstrap edge frequency is easy to over-read: an edge appearing in 90% of runs
+looks confident, but if random initialization alone produces it 90% of the time
+the frequency is telling you about the search, not the data.
+
+:func:`search_path_diagnostic` isolates that confound by running K hill climbs
+from random starts on the *same, unresampled* data, so the only source of
+variation is the search path. :func:`compare_dag_sets` then puts those
+frequencies side by side with bootstrap frequencies. Edges with a large
+``abs_diff`` are the ones whose apparent stability comes from one source and not
+the other, and are worth inspecting before being believed.
 """
 
 from collections import Counter
 
-import networkx as nx
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from pgmpy.base import DAG
-from pgmpy.estimators import ExpertKnowledge
 from tqdm import tqdm
 
-
-def random_acyclic_subgraph(nodes, allowed_edges, inclusion_prob=0.15, rng=None):
-    """Generate a random DAG by greedily adding allowed edges without creating cycles."""
-    if rng is None:
-        rng = np.random.default_rng()
-
-    dag = DAG()
-    dag.add_nodes_from(nodes)
-
-    edges = list(allowed_edges)
-    rng.shuffle(edges)
-
-    for u, v in edges:
-        if rng.random() > inclusion_prob:
-            continue
-        dag.add_edge(u, v)
-        if not nx.is_directed_acyclic_graph(dag):
-            dag.remove_edge(u, v)
-
-    return dag
+from causomic.graph_construction.posterior_estimation.hill_climb import (
+    random_acyclic_subgraph,
+)
 
 
 def run_single_random_init(
@@ -55,6 +42,10 @@ def run_single_random_init(
     logging.getLogger("pgmpy").setLevel(logging.WARNING)
 
     rng = np.random.default_rng(seed)
+    # Left at random_acyclic_subgraph's default max_indegree on purpose: this must
+    # match how process_bootstrap builds its random_init start DAGs, or
+    # compare_dag_sets would be contrasting two differently-seeded searches rather
+    # than isolating search-path dependence.
     start_dag = random_acyclic_subgraph(nodes, allowed_edges, inclusion_prob, rng)
 
     scorer = score_fn(data, edge_priors=edge_priors)

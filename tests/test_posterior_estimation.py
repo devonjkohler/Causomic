@@ -1,4 +1,4 @@
-"""Tests for the pure helper functions in prior_data_reconciliation.
+"""Tests for the pure helper functions in posterior_estimation.
 
 Covers the deterministic / data-transform helpers only:
 
@@ -31,7 +31,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-pdr = importlib.import_module("causomic.graph_construction.prior_data_reconciliation")
+edge_priors = importlib.import_module(
+    "causomic.graph_construction.posterior_estimation.edge_priors"
+)
+hill_climb = importlib.import_module("causomic.graph_construction.posterior_estimation.hill_climb")
+scores = importlib.import_module("causomic.graph_construction.posterior_estimation.scores")
+bootstrap = importlib.import_module("causomic.graph_construction.posterior_estimation.bootstrap")
+dagma = importlib.import_module("causomic.graph_construction.posterior_estimation.dagma")
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +48,7 @@ def test_random_acyclic_subgraph_is_acyclic_and_subset():
     # Contains a cycle A->B->C->D->A; result must still be acyclic.
     allowed = [("A", "B"), ("B", "C"), ("C", "D"), ("D", "A")]
     rng = np.random.default_rng(0)
-    dag = pdr.random_acyclic_subgraph(nodes, allowed, inclusion_prob=1.0, rng=rng)
+    dag = hill_climb.random_acyclic_subgraph(nodes, allowed, inclusion_prob=1.0, rng=rng)
     assert nx.is_directed_acyclic_graph(dag)
     assert set(dag.nodes()) == set(nodes)
     assert set(dag.edges()).issubset(set(allowed))
@@ -52,7 +58,7 @@ def test_random_acyclic_subgraph_zero_prob_adds_no_edges():
     nodes = ["A", "B", "C"]
     allowed = [("A", "B"), ("B", "C")]
     rng = np.random.default_rng(1)
-    dag = pdr.random_acyclic_subgraph(nodes, allowed, inclusion_prob=0.0, rng=rng)
+    dag = hill_climb.random_acyclic_subgraph(nodes, allowed, inclusion_prob=0.0, rng=rng)
     assert dag.number_of_edges() == 0
     assert set(dag.nodes()) == set(nodes)
 
@@ -60,8 +66,8 @@ def test_random_acyclic_subgraph_zero_prob_adds_no_edges():
 def test_random_acyclic_subgraph_deterministic_with_seed():
     nodes = ["A", "B", "C", "D"]
     allowed = [("A", "B"), ("B", "C"), ("C", "D"), ("A", "C")]
-    d1 = pdr.random_acyclic_subgraph(nodes, allowed, 0.6, np.random.default_rng(42))
-    d2 = pdr.random_acyclic_subgraph(nodes, allowed, 0.6, np.random.default_rng(42))
+    d1 = hill_climb.random_acyclic_subgraph(nodes, allowed, 0.6, np.random.default_rng(42))
+    d2 = hill_climb.random_acyclic_subgraph(nodes, allowed, 0.6, np.random.default_rng(42))
     assert set(d1.edges()) == set(d2.edges())
 
 
@@ -71,7 +77,9 @@ def test_random_acyclic_subgraph_respects_max_indegree():
     nodes = ["A", "B", "C", "T"]
     allowed = [("A", "T"), ("B", "T"), ("C", "T")]
     rng = np.random.default_rng(7)
-    dag = pdr.random_acyclic_subgraph(nodes, allowed, inclusion_prob=1.0, rng=rng, max_indegree=1)
+    dag = hill_climb.random_acyclic_subgraph(
+        nodes, allowed, inclusion_prob=1.0, rng=rng, max_indegree=1
+    )
     assert len(dag.get_parents("T")) <= 1
     assert nx.is_directed_acyclic_graph(dag)
 
@@ -87,7 +95,7 @@ def test_calculate_edge_probabilities_cdf_properties():
             "evidence_count": [1, 2, 5, 10],
         }
     )
-    mapping = pdr.calculate_edge_probabilities(df)
+    mapping = edge_priors.calculate_edge_probabilities(df)
 
     xmin = 1
     xmax = 10
@@ -111,7 +119,7 @@ def test_calculate_edge_probabilities_custom_count_col():
             "source_count": [3, 7],
         }
     )
-    mapping = pdr.calculate_edge_probabilities(df, count_col="source_count")
+    mapping = edge_priors.calculate_edge_probabilities(df, count_col="source_count")
     assert set(mapping.keys()) == set(range(3, 8))
     assert np.isclose(mapping[7], 1.0)
 
@@ -127,7 +135,7 @@ def test_prepare_indra_priors_no_conversion_returns_raw_counts():
             "evidence_count": [15, 25, 8],
         }
     )
-    priors = pdr.prepare_indra_priors(df, convert_to_probability=False)
+    priors = edge_priors.prepare_indra_priors(df, convert_to_probability=False)
     assert priors == {
         ("AKT1", "MDM2"): 15,
         ("TP53", "MDM2"): 25,
@@ -143,7 +151,7 @@ def test_prepare_indra_priors_sigmoid_conversion():
             "evidence_count": [15, 25],
         }
     )
-    priors = pdr.prepare_indra_priors(df, convert_to_probability=True)
+    priors = edge_priors.prepare_indra_priors(df, convert_to_probability=True)
 
     # Keys are the (source, target) tuples.
     assert set(priors.keys()) == {("AKT1", "MDM2"), ("TP53", "MDM2")}
@@ -168,7 +176,9 @@ def test_prepare_indra_priors_use_source_counts():
             "source_count": [50, 60],
         }
     )
-    priors = pdr.prepare_indra_priors(df, convert_to_probability=False, use_source_counts=True)
+    priors = edge_priors.prepare_indra_priors(
+        df, convert_to_probability=False, use_source_counts=True
+    )
     assert priors == {("A", "X"): 50, ("B", "Y"): 60}
 
 
@@ -187,7 +197,7 @@ def test_remove_high_corr_edges_from_blacklist():
     indra_priors = pd.DataFrame({"source": ["A"], "target": ["C"], "evidence_count": [10]})
     black_list = {("A", "B"), ("B", "A"), ("A", "C")}
 
-    updated_priors, updated_blacklist = pdr.remove_high_corr_edges_from_blacklist(
+    updated_priors, updated_blacklist = edge_priors.remove_high_corr_edges_from_blacklist(
         data, indra_priors, black_list, corr_threshold=0.99, verbose=False
     )
 
@@ -218,7 +228,7 @@ def test_remove_high_corr_edges_from_blacklist_keeps_low_corr():
     indra_priors = pd.DataFrame({"source": ["A"], "target": ["B"], "evidence_count": [3]})
     black_list = {("A", "B")}
 
-    _, updated_blacklist = pdr.remove_high_corr_edges_from_blacklist(
+    _, updated_blacklist = edge_priors.remove_high_corr_edges_from_blacklist(
         data, indra_priors, black_list, corr_threshold=0.9, verbose=False
     )
     # Correlation below threshold: blacklist edge is preserved.
@@ -243,14 +253,14 @@ def test_bic_gauss_indra_priors_observational_regression():
     )
     edge_priors = {("X", "Y"): 0.8, ("Z", "Y"): 0.3}
 
-    scorer_default = pdr.BICGaussIndraPriors(data, edge_priors=edge_priors, prior_strength=2.0)
+    scorer_default = scores.BICGaussIndraPriors(data, edge_priors=edge_priors, prior_strength=2.0)
     score_default = scorer_default.local_score("Y", ["X", "Z"])
 
     # Snapshot value - computed once from this exact implementation. A future
     # change that silently alters the observational code path should break this.
     assert score_default == pytest.approx(4.747972022632462)
 
-    scorer_flag_only = pdr.BICGaussIndraPriors(
+    scorer_flag_only = scores.BICGaussIndraPriors(
         data, edge_priors=edge_priors, prior_strength=2.0, interventional=True
     )
     score_flag_only = scorer_flag_only.local_score("Y", ["X", "Z"])
@@ -273,7 +283,7 @@ def test_bic_gauss_indra_priors_clamped_parent_still_usable_as_regressor():
     arm_labels = pd.Series(["clampB"] * n, index=data.index)
     clamped_nodes = {"clampB": ["B"]}
 
-    scorer = pdr.BICGaussIndraPriors(
+    scorer = scores.BICGaussIndraPriors(
         data,
         edge_priors={("B", "C"): 0.5},
         interventional=True,
@@ -290,7 +300,7 @@ def test_bic_gauss_indra_priors_variable_clamped_in_every_arm_returns_neg_inf():
     arm_labels = pd.Series(["only_arm"] * 3, index=data.index)
     clamped_nodes = {"only_arm": ["A"]}
 
-    scorer = pdr.BICGaussIndraPriors(
+    scorer = scores.BICGaussIndraPriors(
         data,
         edge_priors={("B", "A"): 0.5},
         interventional=True,
@@ -333,26 +343,26 @@ def test_bic_gauss_indra_priors_tiny_arm_does_not_make_candidate_unscorable():
     arm_labels = pd.Series(["big"] * n_big + ["tiny"] * n_tiny, index=data.index)
     edge_priors = {("P1", "Y"): 0.5, ("P2", "Y"): 0.5}
 
-    scorer = pdr.BICGaussIndraPriors(
+    scorer = scores.BICGaussIndraPriors(
         data, edge_priors=edge_priors, interventional=True, arm_labels=arm_labels, clamped_nodes={}
     )
     score = scorer.local_score("Y", ["P1", "P2"])
     assert np.isfinite(score)
 
-    flat = pdr.BICGaussIndraPriors(data, edge_priors=edge_priors).local_score("Y", ["P1", "P2"])
+    flat = scores.BICGaussIndraPriors(data, edge_priors=edge_priors).local_score("Y", ["P1", "P2"])
     assert score == flat
 
     # Clamping Y in the tiny arm is what drops rows - and only those rows.
-    scorer_clamped = pdr.BICGaussIndraPriors(
+    scorer_clamped = scores.BICGaussIndraPriors(
         data,
         edge_priors=edge_priors,
         interventional=True,
         arm_labels=arm_labels,
         clamped_nodes={"tiny": ["Y"]},
     )
-    flat_big_only = pdr.BICGaussIndraPriors(data.iloc[:n_big], edge_priors=edge_priors).local_score(
-        "Y", ["P1", "P2"]
-    )
+    flat_big_only = scores.BICGaussIndraPriors(
+        data.iloc[:n_big], edge_priors=edge_priors
+    ).local_score("Y", ["P1", "P2"])
     assert scorer_clamped.local_score("Y", ["P1", "P2"]) == flat_big_only
 
 
@@ -402,13 +412,13 @@ def test_bic_gauss_indra_priors_interventional_identifies_chain_orientation():
     reverse_chain = {"C": [], "B": ["C"], "A": ["B"]}
 
     # Observational-only: the two Markov-equivalent hypotheses tie exactly.
-    scorer_obs = pdr.BICGaussIndraPriors(data.loc[arm_labels == "obs"], edge_priors=edge_priors)
+    scorer_obs = scores.BICGaussIndraPriors(data.loc[arm_labels == "obs"], edge_priors=edge_priors)
     score_true_obs = total_score(scorer_obs, true_chain)
     score_reverse_obs = total_score(scorer_obs, reverse_chain)
     assert score_true_obs == pytest.approx(score_reverse_obs, abs=1e-6)
 
     # Interventional: clamping B breaks the tie decisively in favor of the truth.
-    scorer_int = pdr.BICGaussIndraPriors(
+    scorer_int = scores.BICGaussIndraPriors(
         data,
         edge_priors=edge_priors,
         interventional=True,
@@ -433,7 +443,7 @@ def _combined_big_small(n_big=20, n_small=3):
 
 def test_resample_with_arm_floor_disabled_matches_plain_sample():
     combined = _combined_big_small()
-    got = pdr._resample_with_arm_floor(
+    got = bootstrap._resample_with_arm_floor(
         combined, "__arm_label__", frac=0.65, replace=True, floor=0, rng=np.random.RandomState(0)
     )
     want = combined.sample(frac=0.65, replace=True, random_state=np.random.RandomState(0))
@@ -446,7 +456,7 @@ def test_resample_with_arm_floor_keeps_small_arm_intact_across_seeds():
 
     big_arm_varied = False
     for seed in range(20):
-        resampled = pdr._resample_with_arm_floor(
+        resampled = bootstrap._resample_with_arm_floor(
             combined,
             "__arm_label__",
             frac=0.65,
@@ -468,7 +478,7 @@ def test_resample_with_arm_floor_keeps_small_arm_intact_across_seeds():
 
 def test_resample_with_arm_floor_all_arms_above_floor_resamples_everything():
     combined = _combined_big_small(n_big=20, n_small=12)
-    resampled = pdr._resample_with_arm_floor(
+    resampled = bootstrap._resample_with_arm_floor(
         combined,
         "__arm_label__",
         frac=0.5,
@@ -487,7 +497,7 @@ def test_resample_with_arm_floor_all_arms_above_floor_resamples_everything():
 def test_build_dagma_exclude_edges_excludes_everything_not_allowed():
     nodes = ["A", "B", "C"]
     allowed = {("A", "B"), ("B", "C")}
-    excluded = pdr._build_dagma_exclude_edges(nodes, allowed)
+    excluded = dagma._build_dagma_exclude_edges(nodes, allowed)
 
     index = {n: i for i, n in enumerate(nodes)}
     allowed_idx = {(index[u], index[v]) for u, v in allowed}
@@ -504,7 +514,7 @@ def test_build_dagma_exclude_edges_excludes_everything_not_allowed():
 def test_build_dagma_exclude_edges_empty_when_all_pairs_allowed():
     nodes = ["A", "B"]
     allowed = {("A", "B"), ("B", "A")}
-    assert pdr._build_dagma_exclude_edges(nodes, allowed) == ()
+    assert dagma._build_dagma_exclude_edges(nodes, allowed) == ()
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +533,7 @@ def test_run_dagma_only_learns_prior_allowed_edges():
     # Prior only allows A->B; C is left fully unconstrained/unconnected.
     indra_priors = pd.DataFrame({"source": ["A"], "target": ["B"], "evidence_count": [10]})
 
-    dag = pdr.run_dagma(data, indra_priors, lambda1=0.02, w_threshold=0.2, verbose=False)
+    dag = dagma.run_dagma(data, indra_priors, lambda1=0.02, w_threshold=0.2, verbose=False)
 
     assert set(dag.nodes()) == {"A", "B", "C"}
     assert nx.is_directed_acyclic_graph(dag)
@@ -544,7 +554,7 @@ def test_run_dagma_blocks_true_edge_when_prior_forbids_it():
 
     indra_priors = pd.DataFrame({"source": ["B"], "target": ["A"], "evidence_count": [10]})
 
-    dag = pdr.run_dagma(data, indra_priors, lambda1=0.02, w_threshold=0.2, verbose=False)
+    dag = dagma.run_dagma(data, indra_priors, lambda1=0.02, w_threshold=0.2, verbose=False)
 
     # The hard blacklist must prevent A->B even though the data strongly
     # supports it -- this is the "only allow prior edges" guarantee.
@@ -564,7 +574,7 @@ def test_run_dagma_forwards_fit_kwargs():
     data = pd.DataFrame({"A": A, "B": B})
     indra_priors = pd.DataFrame({"source": ["A"], "target": ["B"], "evidence_count": [10]})
 
-    dag = pdr.run_dagma(
+    dag = dagma.run_dagma(
         data,
         indra_priors,
         lambda1=0.02,
@@ -582,7 +592,7 @@ def test_run_dagma_forwards_fit_kwargs():
 def test_evidence_penalty_neutral_belief_gives_unit_multiplier():
     belief = np.array([[0.5, 0.5], [0.5, 0.5]])
     mask = np.array([[False, True], [False, False]])
-    C = pdr.evidence_penalty(belief, mask)
+    C = dagma.evidence_penalty(belief, mask)
     # p=0.5 -> log-odds 0 -> multiplier exp(0) == 1.
     assert np.isclose(C[0, 1], 1.0)
 
@@ -590,7 +600,7 @@ def test_evidence_penalty_neutral_belief_gives_unit_multiplier():
 def test_evidence_penalty_strong_evidence_lowers_penalty():
     belief = np.array([[0.5, 0.95], [0.05, 0.5]])
     mask = np.array([[False, True], [True, False]])
-    C = pdr.evidence_penalty(belief, mask)
+    C = dagma.evidence_penalty(belief, mask)
     # Strong positive evidence (p=0.95) -> multiplier < 1 (encourages the edge).
     assert C[0, 1] < 1.0
     # Weak/negative evidence (p=0.05) -> multiplier > 1 (discourages the edge).
@@ -600,7 +610,7 @@ def test_evidence_penalty_strong_evidence_lowers_penalty():
 def test_evidence_penalty_only_reweights_masked_positions():
     belief = np.array([[0.99, 0.01], [0.5, 0.5]])
     mask = np.array([[False, False], [False, False]])
-    C = pdr.evidence_penalty(belief, mask)
+    C = dagma.evidence_penalty(belief, mask)
     # Nothing is masked -> multiplier stays at the DAGMA default of 1.0
     # everywhere, regardless of how extreme the (unused) belief values are.
     assert np.array_equal(C, np.ones_like(belief))
@@ -609,7 +619,7 @@ def test_evidence_penalty_only_reweights_masked_positions():
 def test_evidence_penalty_clip_bounds_extreme_log_odds():
     belief = np.array([[1 - 1e-9]])
     mask = np.array([[True]])
-    C = pdr.evidence_penalty(belief, mask, clip=1.0)
+    C = dagma.evidence_penalty(belief, mask, clip=1.0)
     # exp(-clip) is the floor regardless of how extreme belief is.
     assert np.isclose(C[0, 0], np.exp(-1.0))
 
@@ -621,10 +631,10 @@ def test_evidence_penalty_center_removes_uniform_evidence_level():
     belief = np.array([0.9, 0.9])
     mask = np.array([True, True])
 
-    uncentered = pdr.evidence_penalty(belief, mask, center=False)
+    uncentered = dagma.evidence_penalty(belief, mask, center=False)
     assert np.all(uncentered < 1.0)
 
-    centered = pdr.evidence_penalty(belief, mask, center=True)
+    centered = dagma.evidence_penalty(belief, mask, center=True)
     assert np.allclose(centered, 1.0)
 
 
@@ -634,7 +644,7 @@ def test_evidence_penalty_center_removes_uniform_evidence_level():
 def test_build_dagma_belief_matrix_fills_from_edge_priors():
     nodes = ["A", "B", "C"]
     edge_priors = {("A", "B"): 0.9}
-    belief, mask = pdr._build_dagma_belief_matrix(nodes, edge_priors, default_belief=0.5)
+    belief, mask = dagma._build_dagma_belief_matrix(nodes, edge_priors, default_belief=0.5)
 
     assert belief.shape == (3, 3)
     assert mask.shape == (3, 3)
@@ -650,7 +660,7 @@ def test_build_dagma_belief_matrix_fills_from_edge_priors():
 def test_build_dagma_belief_matrix_ignores_unknown_nodes():
     nodes = ["A", "B"]
     edge_priors = {("A", "Z"): 0.9, ("A", "B"): 0.7}
-    belief, mask = pdr._build_dagma_belief_matrix(nodes, edge_priors)
+    belief, mask = dagma._build_dagma_belief_matrix(nodes, edge_priors)
     # ("A", "Z") can't be placed (Z isn't in node_order) and must be skipped
     # without error; ("A", "B") still lands correctly.
     assert mask.sum() == 1
@@ -681,10 +691,10 @@ def test_run_dagma_evidence_weighting_prunes_weak_evidence_edge_first():
     pytest.importorskip("dagma")
     data, indra_priors = _strong_vs_weak_evidence_data()
 
-    unweighted = pdr.run_dagma(
+    unweighted = dagma.run_dagma(
         data, indra_priors.copy(), lambda1=0.3, w_threshold=0.1, use_evidence_weights=False
     )
-    weighted = pdr.run_dagma(
+    weighted = dagma.run_dagma(
         data, indra_priors.copy(), lambda1=0.3, w_threshold=0.1, use_evidence_weights=True
     )
 
@@ -702,10 +712,10 @@ def test_run_dagma_evidence_weighting_can_rescue_edge_from_over_pruning():
 
     # A lambda1 large enough that the uniform L1 penalty prunes every edge,
     # including the true A->B effect.
-    unweighted = pdr.run_dagma(
+    unweighted = dagma.run_dagma(
         data, indra_priors.copy(), lambda1=0.5, w_threshold=0.1, use_evidence_weights=False
     )
-    weighted = pdr.run_dagma(
+    weighted = dagma.run_dagma(
         data, indra_priors.copy(), lambda1=0.5, w_threshold=0.1, use_evidence_weights=True
     )
 

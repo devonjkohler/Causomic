@@ -1,46 +1,70 @@
-"""Repair posterior DAGs by resolving failed conditional-independence tests.
+"""Explain failed independence tests with confounders drawn from INDRA.
 
-Converts learned posterior DAGs to y0 graphs and processes failed CI tests to
-propose fixes, such as introducing latent confounders between affected nodes.
+When a conditional-independence test fails, an unmeasured common cause is the
+usual suspect. Rather than immediately declaring a latent variable, this module
+first asks whether a *measured* variable can account for the dependence:
+
+1. :func:`lookup_confounder_candidates` asks the INDRA prior graph which nodes
+   are shared upstream regulators of the two variables in question.
+2. :func:`process_failed_test` conditions on combinations of those candidates
+   and re-tests, keeping the first set that restores independence.
+
+A candidate set that works becomes real directed edges in the repaired graph. If
+nothing works, the dependence is attributed to a genuine latent confounder and a
+bidirected edge is added instead -- an honest record of unresolved confounding
+rather than a silently mis-specified DAG.
 """
 
 from itertools import combinations
 
-import networkx as nx
 import numpy as np
 import pandas as pd
 from pgmpy.estimators.CITests import pearsonr
-from y0.graph import NxMixedGraph
+from tqdm import tqdm
+
+from causomic.graph_construction.prior_extraction.nx_backend import query_confounders
 
 
-def convert_to_y0_graph(posterior_dag):
+def lookup_confounder_candidates(indra_graph, failed_tests: pd.DataFrame, verbose: bool = True):
+    """Collect candidate confounders from INDRA for each failed test pair.
+
+    Parameters
+    ----------
+    indra_graph : nx.DiGraph
+        INDRA prior network annotated with edge evidence.
+    failed_tests : pd.DataFrame
+        Output of
+        :func:`~causomic.graph_construction.ci_repair.falsification.find_failed_tests`;
+        only its 'left'/'right' columns are read.
+    verbose : bool, default=True
+        Show a progress bar over the unique node pairs.
+
+    Returns
+    -------
+    dict
+        ``{(left, right): [candidate, ...]}`` with candidates ordered by total
+        supporting evidence, strongest first. Pairs with no shared upstream
+        regulator in ``indra_graph`` map to an empty array.
     """
-    Convert the posterior DAG to a y0 graph format.
-    """
+    query_relations = failed_tests[["left", "right"]].drop_duplicates().reset_index(drop=True)
 
-    # Confirm index is fine
-    posterior_dag = posterior_dag.reset_index(drop=True)
+    confounder_relations = {}
+    iterator = range(len(query_relations))
+    if verbose:
+        iterator = tqdm(iterator, desc="Pulling confounder relations")
 
-    # Construct NetworkX DiGraph from posterior_dag
-    all_nodes = set(posterior_dag["source"]).union(set(posterior_dag["target"]))
+    for i in iterator:
+        nodes = [query_relations.loc[i, "left"], query_relations.loc[i, "right"]]
+        indra_relations = query_confounders(indra_graph, nodes)
+        indra_relations = (
+            indra_relations.groupby(["source"], as_index=False)["evidence_count"]
+            .sum()
+            .sort_values(by="evidence_count", ascending=False)["source"]
+            .values
+        )
+        confounder_relations[tuple(nodes)] = indra_relations
 
-    nx_dag = nx.DiGraph()
-    for i in range(len(posterior_dag)):
-        nx_dag.add_edge(posterior_dag.loc[i, "source"], posterior_dag.loc[i, "target"])
-
-    obs_nodes = all_nodes
-
-    # Set all nodes as observed
-    attrs = {
-        node: (True if node not in obs_nodes and node != "\\n" else False) for node in all_nodes
-    }
-    nx.set_node_attributes(nx_dag, attrs, name="hidden")
-
-    # Use y0 to build ADMG
-    y0_graph = NxMixedGraph()
-    y0_graph = y0_graph.from_latent_variable_dag(nx_dag, "hidden")
-
-    return y0_graph
+    return confounder_relations
 
 
 def process_failed_test(

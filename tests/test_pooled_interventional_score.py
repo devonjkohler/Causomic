@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-pdr = importlib.import_module("causomic.graph_construction.prior_data_reconciliation")
+scores = importlib.import_module("causomic.graph_construction.posterior_estimation.scores")
 
 logging.getLogger("pgmpy").setLevel(logging.ERROR)
 
@@ -70,7 +70,7 @@ def _two_node_scm(seed: int = 0, n_per_arm: int = 30):
 
 
 def _scorer(data, arm_labels, clamped_nodes):
-    return pdr.BICGaussIndraPriors(
+    return scores.BICGaussIndraPriors(
         data,
         edge_priors=EDGE_PRIORS,
         interventional=True,
@@ -113,7 +113,7 @@ def test_penalty_uses_retained_row_count():
 
     # Scoring "B": only "do_B" clamps B, so "obs" + "do_A" rows are retained.
     retained = data.loc[(arm_labels != "do_B").values]
-    reference = pdr.BICGaussIndraPriors(retained, edge_priors=EDGE_PRIORS)
+    reference = scores.BICGaussIndraPriors(retained, edge_priors=EDGE_PRIORS)
     ll, df_model = reference._log_likelihood(variable="B", parents=["A"])
     expected = ll - (((df_model + 2) / 2) * np.log(len(retained)))
 
@@ -155,7 +155,7 @@ def test_score_reduces_to_observational_when_nothing_is_clamped():
     interventions."""
     data, arm_labels, _ = _two_node_scm()
 
-    flat = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS).local_score("B", ["A"])
+    flat = scores.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS).local_score("B", ["A"])
 
     # Multi-arm labels, but no clamps anywhere.
     assert _scorer(data, arm_labels, {}).local_score("B", ["A"]) == flat
@@ -184,7 +184,7 @@ def test_score_retains_rows_where_a_parent_is_clamped():
         assert f"do_{parent}" in retained_arms
         assert len(retained) == 60
 
-        reference = pdr.BICGaussIndraPriors(retained, edge_priors=EDGE_PRIORS)
+        reference = scores.BICGaussIndraPriors(retained, edge_priors=EDGE_PRIORS)
         ll, df_model = reference._log_likelihood(variable=variable, parents=[parent])
         expected = ll - (((df_model + 2) / 2) * np.log(len(retained)))
 
@@ -217,13 +217,13 @@ def test_observational_path_unaffected_by_the_interventional_branch():
     to exact equality.
     """
     data, _, _ = _two_node_scm()
-    scorer = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS)
+    scorer = scores.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS)
 
     assert scorer.local_score("B", ["A"]) == pytest.approx(-181.9218239637686, rel=1e-9)
     assert scorer.local_score("A", ["B"]) == pytest.approx(-154.11763570887948, rel=1e-9)
 
     # interventional=True without arm_labels must stay on the flat path.
-    flag_only = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS, interventional=True)
+    flag_only = scores.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS, interventional=True)
     assert flag_only.local_score("B", ["A"]) == scorer.local_score("B", ["A"])
 
 
@@ -231,7 +231,7 @@ def test_observational_path_unaffected_by_the_interventional_branch():
 # BICGaussNoPriors - same pooled interventional score, minus the prior term
 # ---------------------------------------------------------------------------
 def _no_priors_scorer(data, arm_labels, clamped_nodes):
-    return pdr.BICGaussNoPriors(
+    return scores.BICGaussNoPriors(
         data, interventional=True, arm_labels=arm_labels, clamped_nodes=clamped_nodes
     )
 
@@ -249,7 +249,7 @@ def test_no_priors_interventional_differs_from_prior_aware_only_by_the_prior():
     data, arm_labels, clamped_nodes = _two_node_scm()
 
     no_priors = _no_priors_scorer(data, arm_labels, clamped_nodes)
-    with_priors = pdr.BICGaussIndraPriors(
+    with_priors = scores.BICGaussIndraPriors(
         data,
         edge_priors=SKEWED_EDGE_PRIORS,
         interventional=True,
@@ -283,7 +283,7 @@ def test_no_priors_penalty_uses_retained_row_count():
     data, arm_labels, clamped_nodes = _two_node_scm()
 
     retained = data.loc[(arm_labels != "do_B").values]
-    reference = pdr.BICGaussNoPriors(retained)
+    reference = scores.BICGaussNoPriors(retained)
     ll, df_model = reference._log_likelihood(variable="B", parents=["A"])
     expected = ll - (((df_model + 2) / 2) * np.log(len(retained)))
 
@@ -295,7 +295,7 @@ def test_no_priors_score_reduces_to_observational_when_nothing_is_clamped():
     move a score."""
     data, arm_labels, _ = _two_node_scm()
 
-    flat = pdr.BICGaussNoPriors(data).local_score("B", ["A"])
+    flat = scores.BICGaussNoPriors(data).local_score("B", ["A"])
 
     assert _no_priors_scorer(data, arm_labels, {}).local_score("B", ["A"]) == flat
     assert _no_priors_scorer(data, arm_labels, None).local_score("B", ["A"]) == flat
@@ -314,7 +314,7 @@ def test_no_priors_observational_path_unaffected():
     """The default (no interventional kwargs) path still returns plain BIC, and
     `interventional=True` without `arm_labels` stays on it."""
     data, _, _ = _two_node_scm()
-    scorer = pdr.BICGaussNoPriors(data)
+    scorer = scores.BICGaussNoPriors(data)
 
     ll, df_model = scorer._log_likelihood(variable="B", parents=["A"])
     expected = ll - (((df_model + 2) / 2) * np.log(len(data)))
@@ -322,10 +322,10 @@ def test_no_priors_observational_path_unaffected():
 
     # No prior bonus: identical to the prior-aware scorer at p=0.5, where the
     # bonus is exactly log(1) == 0.
-    with_neutral_priors = pdr.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS)
+    with_neutral_priors = scores.BICGaussIndraPriors(data, edge_priors=EDGE_PRIORS)
     assert scorer.local_score("B", ["A"]) == with_neutral_priors.local_score("B", ["A"])
 
-    flag_only = pdr.BICGaussNoPriors(data, interventional=True)
+    flag_only = scores.BICGaussNoPriors(data, interventional=True)
     assert flag_only.local_score("B", ["A"]) == expected
 
 
@@ -335,4 +335,4 @@ def test_no_priors_rejects_misaligned_arm_labels():
     bad_labels = pd.Series(["obs"] * len(data), index=range(1000, 1000 + len(data)))
 
     with pytest.raises(AssertionError, match="arm_labels must share data's index"):
-        pdr.BICGaussNoPriors(data, interventional=True, arm_labels=bad_labels)
+        scores.BICGaussNoPriors(data, interventional=True, arm_labels=bad_labels)

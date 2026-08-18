@@ -12,7 +12,6 @@ utilities for tracking graph sizes across workflow steps:
 """
 
 import os
-import pickle
 from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -22,11 +21,11 @@ import pandas as pd
 from y0.graph import NxMixedGraph
 
 from causomic.causal_model import LVM
-from causomic.graph_construction.prior_data_reconciliation import (
+from causomic.graph_construction.posterior_estimation import (
     BICGaussIndraPriors,
     SparseHillClimb,
 )
-from causomic.graph_construction.utils_nx import (
+from causomic.graph_construction.prior_extraction import (
     query_drug_targets,
     query_effect_nodes,
     query_forward_paths,
@@ -293,7 +292,7 @@ def run_causal_workflow(
         for why that's the intended behavior rather than an oversight.
     indra_graph : nx.DiGraph
         INDRA prior graph with edge evidence attributes (e.g. produced by
-        `causomic.graph_construction.prepare_graph`).
+        `causomic.graph_construction.prior_extraction.prepare_graph`).
     target_nodes : sequence of str
         Known upstream gene symbols to use as `start_nodes` for
         `query_forward_paths` and as the intervention target set.

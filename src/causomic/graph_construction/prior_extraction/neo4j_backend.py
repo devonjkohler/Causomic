@@ -1,27 +1,27 @@
-"""
-Graph Construction Utilities for INDRA Network Queries
+"""Cypher query builders for the INDRA-CoGEx Neo4j backend.
 
-This module provides utility functions for constructing biological networks
-from the INDRA (Integrated Network and Dynamical Reasoning Assembler) database.
-It supports various types of network queries including neighbor networks,
-multi-step pathways, and confounding relationships.
+Every function here takes CURIEs (see
+:func:`~causomic.graph_construction.prior_extraction.identifiers.resolve_curies`),
+builds a Cypher query, and returns raw INDRA ``Relation`` objects. Turning those
+into a DataFrame is
+:func:`~causomic.graph_construction.prior_extraction.formatting.format_query_results`'s
+job; :mod:`~causomic.graph_construction.prior_extraction.neo4j_pulls` composes
+the two for the common cases.
 
 Key functionality:
 - Direct neighbor network queries (upstream/downstream)
-- Multi-step pathway construction (2-4 steps)
+- Multi-step pathway construction (1-4 steps)
 - Confounding and mediating relationship detection
-- Flexible node and relationship filtering
+- Compound-gene and MeSH disease-gene association queries
 - Evidence count thresholding for reliability
 
 Author: Devon Kohler
 """
 
 # Standard library imports
-from sre_constants import IN
 from textwrap import dedent
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
-from indra.databases.hgnc_client import get_hgnc_id, get_uniprot_id
 from indra.statements import Statement
 
 # INDRA imports (indra-cogex is an optional dependency, see causomic._optional)
@@ -33,9 +33,6 @@ except ImportError:
     from causomic._optional import missing_cogex
 
     Neo4jClient = minimum_evidence_helper = norm_id = missing_cogex
-
-# Database client imports
-from protmapper import uniprot_client
 
 
 def get_neighbor_network(
@@ -567,66 +564,6 @@ def get_one_step_root_down(
     ]
 
 
-def get_id(ids: Iterable[str], id_type: str) -> List[Tuple[str, str]]:
-    """
-    Convert protein/gene identifiers to HGNC format.
-
-    Standardizes various identifier types (UniProt, gene symbols) to HGNC
-    identifiers for consistent use in network queries. Essential for ensuring
-    identifier compatibility across different data sources.
-
-    Parameters
-    ----------
-    ids : Iterable[str]
-        Collection of identifiers to convert
-    id_type : str
-        Type of input identifiers ("uniprot" or "gene")
-
-    Returns
-    -------
-    List[Tuple[str, str]]
-        List of (namespace, identifier) tuples in HGNC format
-
-    Examples
-    --------
-    >>> # Convert UniProt IDs to HGNC
-    >>> uniprot_ids = ["P31749", "P04637"]  # AKT1, TP53
-    >>> hgnc_curies = get_id(uniprot_ids, "uniprot")
-    >>> # Returns: [("hgnc", "391"), ("hgnc", "11998")]
-
-    Notes
-    -----
-    Failed conversions are tracked but not returned. Consider logging
-    conversion failures for debugging identifier mapping issues.
-    """
-    if id_type == "uniprot":
-        uniprot_ids = set(ids)
-
-        hgnc_ids = set()
-        failed = set()
-        for uniprot_id in uniprot_ids:
-            hgnc_id = uniprot_client.get_hgnc_id(uniprot_id)
-            if hgnc_id:
-                hgnc_ids.add(hgnc_id)
-            else:
-                failed.add(uniprot_id)
-
-    elif id_type == "gene":
-        hgnc_ids = set()
-        failed = set()
-        for gene_id in ids:
-            hgnc_id = get_hgnc_id(gene_id)
-            get_uniprot_id(gene_id)
-            if hgnc_id:
-                hgnc_ids.add(hgnc_id)
-            else:
-                failed.add(gene_id)
-
-    hgnc_curies = [("hgnc", gene_id) for gene_id in hgnc_ids if gene_id is not None]
-
-    return hgnc_curies
-
-
 def query_between_relationships(
     nodes: Iterable[Tuple[str, str]], client: Neo4jClient, relation: Iterable[str]
 ) -> List[Statement]:
@@ -792,3 +729,91 @@ def query_mediator_relationships(
         for path in client.query_tx(query)
         for relation in client.neo4j_to_relations(path[0])
     ]
+
+
+def compound_query(*, compounds: Iterable[Tuple[str, str]], client: Neo4jClient) -> List[Statement]:
+    """
+    Query the INDRA database for relationships between compounds and human genes/proteins.
+
+    Retrieves all relationships where the source is one of the specified compounds
+    and the target is a human gene/protein entity. Uses Neo4j Cypher queries to
+    traverse the INDRA knowledge graph.
+
+    Parameters
+    ----------
+    compounds : Iterable[Tuple[str, str]]
+        Iterable of tuples containing compound identifiers.
+        Each tuple should be (namespace, identifier), e.g., ("chebi", "CHEBI:15377")
+    client : Neo4jClient
+        Neo4j client instance for executing database queries
+
+    Returns
+    -------
+    List[Statement]
+        List of INDRA Statement objects representing relationships between
+        the specified compounds and human gene/protein entities
+
+    Examples
+    --------
+    >>> compounds = [("chebi", "CHEBI:15377"), ("chebi", "CHEBI:16991")]
+    >>> statements = compound_query(compounds=compounds, client=neo4j_client)
+    >>> print(f"Found {len(statements)} compound-gene relationships")
+    """
+    compounds_nodes_str = ", ".join(["'%s'" % norm_id(*node) for node in compounds])
+
+    query = dedent(
+        f"""\
+        MATCH p=(n1:BioEntity)-[r1:indra_rel]->(n2:BioEntity)
+        WHERE
+            n1.id IN [{compounds_nodes_str}]
+            AND n1.id <> n2.id
+            AND n2.type = "human_gene_protein"
+        RETURN p
+        """
+    )
+
+    return client.query_relations(query)
+
+
+def mesh_query(query_ids: List[Tuple[str, str]], client: Neo4jClient) -> List[Statement]:
+    """
+    Query Neo4j database for gene-disease associations using MeSH terms.
+
+    Retrieves relationships between human gene/protein entities and specified
+    MeSH (Medical Subject Headings) disease terms. Supports both INDRA
+    relations and gene-disease associations.
+
+    Parameters
+    ----------
+    query_ids : List[Tuple[str, str]]
+        List of tuples containing MeSH identifiers in (namespace, id) format,
+        e.g., [("MESH", "D000544"), ("MESH", "D001943")]
+    client : Neo4jClient
+        Neo4j client instance for executing database queries
+
+    Returns
+    -------
+    List[Statement]
+        List of relationship objects representing gene-disease associations
+
+    Examples
+    --------
+    >>> mesh_terms = [("MESH", "D000544"), ("MESH", "D001943")]  # Alzheimer's, Breast Neoplasms
+    >>> associations = mesh_query(mesh_terms, neo4j_client)
+    >>> print(f"Found {len(associations)} gene-disease associations")
+    """
+    nodes_str = ", ".join(["'%s'" % norm_id(*node) for node in query_ids])
+
+    query = dedent(
+        f"""
+        MATCH p=(n1:BioEntity)-[r1:indra_rel|gene_disease_association]->(n2:BioEntity)
+        WHERE
+            n2.id IN [{nodes_str}]
+            AND n1.id <> n2.id
+            AND n1.type = "human_gene_protein"
+            AND n1.id CONTAINS "hgnc"
+        RETURN p
+        """
+    )
+
+    return client.query_relations(query)

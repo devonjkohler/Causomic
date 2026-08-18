@@ -1,5 +1,5 @@
 """Tests for the pure/synthetic-data-testable helpers in
-causomic.graph_construction.repair.
+causomic.graph_construction.ci_repair.
 
 Two functions are exercised here:
 
@@ -22,7 +22,7 @@ import importlib
 import numpy as np
 import pandas as pd
 
-repair = importlib.import_module("causomic.graph_construction.repair")
+repair = importlib.import_module("causomic.graph_construction.ci_repair")
 
 
 def _posterior_dag(edges):
